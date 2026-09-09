@@ -28,7 +28,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::ListenerNonblockingMode;
 use serde::Serialize;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Interest};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tracing::{debug, info, warn};
 
@@ -39,9 +40,11 @@ use super::attach::{
 use super::frame::lock;
 use super::process::wait_with_output_timeout;
 use super::quic::{
-    ConnectError, PathMonitor, PathState, QuicClientParams, QuicSession, SessionExit, ROAMING_GRACE,
+    local_source_for, ConnectError, PathMonitor, PathState, QuicClientParams, QuicSession,
+    SessionExit, ROAMING_GRACE,
 };
 use crate::config::RemoteTransportConfig;
+use crate::platform::{open_address_change_source, AddressChangeSource};
 use crate::protocol::endpoint::{HEALTH_PING_KIND, TRANSPORT_STATUS_KIND};
 use crate::protocol::{
     ClientMessage, RemoteBootstrapRecord, RemoteQuicHello, ServerMessage, MAX_FRAME_SIZE,
@@ -728,8 +731,10 @@ where
 }
 
 /// Own path liveness for a live connection: probe on the monitor's schedule,
-/// rebind the local socket when the silence looks like a local address change,
-/// and tell the thin client when the path starts or stops recovering.
+/// rebind the local socket when the kernel announces an address change that
+/// moved this path's source address (or, failing such evidence, when the
+/// silence looks like one), and tell the thin client when the path starts or
+/// stops recovering.
 async fn drive_path<S, L>(
     session: &QuicSession,
     send: &AsyncMutex<S>,
@@ -747,10 +752,48 @@ where
         Err(detail) => return PumpExit::Ended(detail),
     };
     let mut monitor = PathMonitor::new(Instant::now());
+    let remote = session.remote_addr();
+    let watcher = open_address_change_watcher();
+    let mut watcher_failed = false;
+    let mut source_address = local_source_for(remote);
 
     loop {
         let deadline = tokio::time::Instant::from_std(monitor.next_deadline(Instant::now()));
         tokio::select! {
+            announced = address_change_announced(if watcher_failed { None } else { watcher.as_ref() }) => {
+                match announced {
+                    Err(detail) => {
+                        // The silence timer still rebinds; only the fast path is gone.
+                        warn!(%detail, "address change notifications stopped; relying on the silence timer");
+                        watcher_failed = true;
+                    }
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let now = Instant::now();
+                        let current = local_source_for(remote);
+                        if current == source_address {
+                            debug!(source = ?current, "network change announced; path source unchanged");
+                        } else {
+                            info!(previous = ?source_address, current = ?current, "local path source changed");
+                            source_address = current;
+                            if monitor.address_changed(now) {
+                                match session.rebind() {
+                                    Ok(()) => info!("remote QUIC socket rebound on address change"),
+                                    Err(detail) => debug!(%detail, "remote QUIC socket rebind failed"),
+                                }
+                                let write = {
+                                    let mut send = send.lock().await;
+                                    write_frame(&mut *send, &ping).await
+                                };
+                                if let Err(detail) = write {
+                                    return PumpExit::Ended(detail);
+                                }
+                                monitor.probe_sent(now);
+                            }
+                        }
+                    }
+                }
+            }
             receipt = receipts.recv() => {
                 if receipt.is_none() {
                     return PumpExit::Ended("remote QUIC stream ended".to_owned());
@@ -799,6 +842,42 @@ where
             }
         }
     }
+}
+
+/// Registers the platform's address-change descriptor with the runtime, or
+/// returns `None` where there is none: the silence timer is then the only
+/// rebind trigger, exactly as before.
+fn open_address_change_watcher() -> Option<AsyncFd<AddressChangeSource>> {
+    let source = match open_address_change_source() {
+        Ok(source) => source,
+        Err(err) => {
+            debug!(%err, "address change notifications unavailable; relying on the silence timer");
+            return None;
+        }
+    };
+    match AsyncFd::with_interest(source, Interest::READABLE) {
+        Ok(watcher) => Some(watcher),
+        Err(err) => {
+            debug!(%err, "failed to register the address change source; relying on the silence timer");
+            None
+        }
+    }
+}
+
+/// Resolves when the kernel has announced a change and says whether any of the
+/// pending messages was address, link, or route evidence. Never resolves
+/// without a watcher, so the branch simply stays idle in the select.
+async fn address_change_announced(
+    watcher: Option<&AsyncFd<AddressChangeSource>>,
+) -> io::Result<bool> {
+    let Some(watcher) = watcher else {
+        return std::future::pending().await;
+    };
+    let mut guard = watcher.readable().await?;
+    let changed = guard.get_inner().drain();
+    // `drain` read until `EAGAIN`, so readiness is spent whatever it found.
+    guard.clear_ready();
+    changed
 }
 
 async fn wait_for_stop(should_stop: &AtomicBool) {

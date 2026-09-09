@@ -4,7 +4,7 @@ use std::process::Command;
 use super::{ClipboardImage, ForegroundJob, Signal};
 
 #[cfg(unix)]
-pub(crate) use super::unix_common::set_default_plugin_pane_pwd;
+pub(crate) use super::unix_common::{set_default_plugin_pane_pwd, AddressChangeSource};
 
 #[cfg(not(unix))]
 pub(crate) fn set_default_plugin_pane_pwd(
@@ -232,4 +232,13 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
 /// Unsupported platform stub.
 pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::Result<bool> {
     Ok(false)
+}
+
+/// Unsupported platform stub: the QUIC bridge falls back to its silence timer.
+#[cfg(unix)]
+pub(crate) fn open_address_change_source() -> std::io::Result<AddressChangeSource> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "address change notifications are not supported on this platform",
+    ))
 }

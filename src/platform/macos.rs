@@ -17,7 +17,7 @@ pub(crate) use super::unix_common::{
     create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,
     remote_private_temp_base, remote_reattach_argument, remote_reattach_program,
     remote_ssh_config_paths, set_default_plugin_pane_pwd, status_commands_supported,
-    wait_client_stream_readable, StatusCommandGuard,
+    wait_client_stream_readable, AddressChangeSource, StatusCommandGuard,
 };
 
 const PROC_PGRP_ONLY: u32 = 2;
@@ -995,6 +995,57 @@ pub fn process_exists(pid: u32) -> bool {
     }
 }
 
+/// Route-socket message types from `<net/route.h>`. `RTM_ADD`, `RTM_DELETE`
+/// and `RTM_CHANGE` are not exported by the libc crate for Apple targets;
+/// the others are, as `c_int`, and `rtm_type` is a `u_char`.
+const ROUTE_ADD: u8 = 0x1;
+const ROUTE_DELETE: u8 = 0x2;
+const ROUTE_CHANGE: u8 = 0x3;
+const ROUTE_NEWADDR: u8 = libc::RTM_NEWADDR as u8;
+const ROUTE_DELADDR: u8 = libc::RTM_DELADDR as u8;
+const ROUTE_IFINFO: u8 = libc::RTM_IFINFO as u8;
+/// Offset of `rtm_type` in `rt_msghdr` (`rtm_msglen: u16`, `rtm_version: u8`
+/// precede it). Every route-socket message shares that prefix.
+const ROUTE_TYPE_OFFSET: usize = 3;
+
+/// Subscribes to the kernel routing socket, which announces every address,
+/// interface, and route change (`route -n monitor` reads the same socket).
+pub(crate) fn open_address_change_source() -> std::io::Result<AddressChangeSource> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let raw = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a freshly created descriptor nothing else owns.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(AddressChangeSource::new(
+        fd,
+        route_message_describes_address_change,
+    ))
+}
+
+/// One routing-socket read returns one message; only its type matters.
+fn route_message_describes_address_change(message: &[u8]) -> bool {
+    matches!(
+        message.get(ROUTE_TYPE_OFFSET),
+        Some(
+            &(ROUTE_ADD
+                | ROUTE_DELETE
+                | ROUTE_CHANGE
+                | ROUTE_NEWADDR
+                | ROUTE_DELADDR
+                | ROUTE_IFINFO)
+        )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1214,5 +1265,30 @@ printf '%s\n' "$@" > "$HERDR_NOTIFY_ARGS"
         assert_eq!(argv[1], "-c");
         assert!(argv[2].contains("EDITOR:-vi"));
         assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
+    }
+
+    #[test]
+    fn route_socket_address_and_link_messages_are_address_change_evidence() {
+        fn message(kind: u8) -> Vec<u8> {
+            let mut message = vec![0u8; std::mem::size_of::<libc::rt_msghdr>()];
+            message[0..2].copy_from_slice(&(message.len() as u16).to_ne_bytes());
+            message[2] = 5;
+            message[ROUTE_TYPE_OFFSET] = kind;
+            message
+        }
+        for kind in [
+            ROUTE_ADD,
+            ROUTE_DELETE,
+            ROUTE_CHANGE,
+            ROUTE_NEWADDR,
+            ROUTE_DELADDR,
+            ROUTE_IFINFO,
+        ] {
+            assert!(route_message_describes_address_change(&message(kind)));
+        }
+        // RTM_GET replies and multicast-address messages are not evidence.
+        assert!(!route_message_describes_address_change(&message(0x4)));
+        assert!(!route_message_describes_address_change(&message(0xf)));
+        assert!(!route_message_describes_address_change(&[]));
     }
 }

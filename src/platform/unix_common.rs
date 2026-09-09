@@ -265,6 +265,88 @@ pub(crate) fn set_default_plugin_pane_pwd(env: &mut Vec<(String, String)>, cwd: 
     }
 }
 
+/// Kernel notifications that a local address, link, or route changed.
+///
+/// One non-blocking descriptor — a netlink route socket on Linux, a `PF_ROUTE`
+/// socket on macOS — that becomes readable whenever the kernel announces a
+/// change to the interfaces the process could send from. The messages are
+/// only *evidence*: the caller decides whether the path it uses was affected.
+/// Nothing here depends on an async runtime; a caller registers the
+/// descriptor with its own reactor and calls [`Self::drain`] when it is
+/// readable.
+pub(crate) struct AddressChangeSource {
+    fd: std::os::fd::OwnedFd,
+    /// Says whether one kernel message (or, on netlink, one datagram of them)
+    /// describes an address, link, or route change.
+    describes_change: fn(&[u8]) -> bool,
+}
+
+impl AddressChangeSource {
+    pub(super) fn new(fd: std::os::fd::OwnedFd, describes_change: fn(&[u8]) -> bool) -> Self {
+        Self {
+            fd,
+            describes_change,
+        }
+    }
+
+    /// Reads every pending message without blocking and reports whether any of
+    /// them described an address, link, or route change.
+    ///
+    /// A receive-queue overflow (`ENOBUFS`, netlink's way of saying messages
+    /// were dropped) counts as a change: something happened and the details
+    /// are gone, so the caller must re-check its path.
+    pub(crate) fn drain(&self) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+        // Netlink multipart replies and route messages with all their
+        // socket addresses both fit comfortably; a datagram larger than this
+        // is truncated, which loses nothing the caller needs (the type is in
+        // the first bytes of every message).
+        let mut buffer = [0u8; 8192];
+        let mut changed = false;
+        loop {
+            let read = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    0,
+                )
+            };
+            if read < 0 {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EAGAIN) => return Ok(changed),
+                    Some(libc::EINTR) => continue,
+                    Some(libc::ENOBUFS) => {
+                        changed = true;
+                        continue;
+                    }
+                    _ => return Err(error),
+                }
+            }
+            if read == 0 {
+                return Ok(changed);
+            }
+            let length = usize::try_from(read).unwrap_or(0).min(buffer.len());
+            if (self.describes_change)(&buffer[..length]) {
+                changed = true;
+            }
+        }
+    }
+}
+
+impl std::os::fd::AsRawFd for AddressChangeSource {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl std::os::fd::AsFd for AddressChangeSource {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

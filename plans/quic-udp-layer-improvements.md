@@ -26,38 +26,81 @@ spend time on the first category.
 
 ## 1. Rebind on address-change evidence, not on a 10 s timer
 
+**Status: implemented and measured** (see "Result" below). Baseline `6f62d3c6`.
+
 **Problem.** `PathMonitor` rebinds the local socket only after
-`REBIND_AFTER` = 10 s of silence (`src/remote/quic.rs:85`). The interface-flap
+`REBIND_AFTER` = 10 s of silence (`src/remote/quic.rs`). The interface-flap
 scenario shows the cost directly: recovering at +2.4 s, rebind at +10.4 s,
 live 2 ms after the rebind. Eight seconds of every flap are the timer, not the
 network. Sleep/wake and tether-to-wifi pay the same.
 
-**Change.** Add an address-change watcher that feeds `PathMonitor` an
-`AddressChanged` event, and rebind immediately when the current path's local
-source address is gone or a new default route appears:
+**Change (as built).** A platform address-change source feeds the bridge's
+path driver, which rebinds the moment the *evidence* says this path's source
+address moved:
 
-- Linux: an `AF_NETLINK`/`NETLINK_ROUTE` socket subscribed to
-  `RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR | RTMGRP_LINK` (libc only, no new
-  crate; ~80 lines). Parse only the message type and interface index.
-- macOS: `SCDynamicStoreCreate` notifications on `State:/Network/Global/IPv4`
-  and `IPv6`, or a `route -n monitor` child as the low-effort first cut.
-- Keep the 10 s silence timer as the fallback for platforms without a watcher.
+- `src/platform/unix_common.rs`: `AddressChangeSource`, one non-blocking
+  descriptor plus a per-platform "does this message describe a change"
+  parser; `drain()` reads everything pending and reports whether any message
+  was address, link, or route evidence (`ENOBUFS` counts as evidence).
+- Linux (`src/platform/linux.rs`): `AF_NETLINK`/`NETLINK_ROUTE` socket
+  subscribed to `RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR |
+  RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE`; only `nlmsghdr` types are parsed.
+  libc only; `nlmsghdr`/`sockaddr_nl` are defined locally because the libc
+  crate does not export them for glibc.
+- macOS (`src/platform/macos.rs`): a `PF_ROUTE` raw socket — the socket
+  `route -n monitor` reads — instead of `SCDynamicStore`: no child process,
+  no CoreFoundation, and it announces `RTM_NEWADDR`/`RTM_DELADDR`/
+  `RTM_IFINFO`/`RTM_ADD`/`RTM_DELETE`/`RTM_CHANGE` directly. Not yet
+  compiled or exercised on a Mac; the parser has a unit test.
+- Other Unix targets: `Err(Unsupported)`; the bridge logs it and keeps the
+  10 s silence timer as the only trigger, exactly as before.
+- `src/remote/quic_bridge.rs` `drive_path`: registers the source with the
+  Tokio reactor (`AsyncFd`) as a fourth `select!` branch. On evidence it
+  re-derives the source address the kernel would use for the peer
+  (`local_source_for`: bind a wildcard UDP socket, `connect()` it, read
+  `local_addr()`; no datagram is sent) and compares with the last known
+  one. Only a *changed* source (including "no route any more") rebinds, so
+  Docker bridges, VPN toggles and periodic IPv6 router advertisements cost
+  one route lookup and nothing else. After the rebind it sends a health ping
+  at once so the new path proves itself within one RTT.
+- `PathMonitor::address_changed`: 500 ms debounce (`REBIND_DEBOUNCE`). A
+  change inside the window is deferred to the end of the window, not
+  dropped, and carried by the next tick with a probe; `next_deadline`
+  accounts for it. An evidence rebind re-arms the `REBIND_AFTER` fallback so
+  the timer does not fire a redundant second rebind. `Lost` ignores
+  evidence. Unit-tested without sockets.
 
-Rebind logic already exists (`rebind_endpoint`, `quic.rs:~735`); the change
-is only *when* it fires. Debounce to one rebind per 500 ms so a flapping
-interface does not thrash the path and discard congestion state (the comment
-at `quic.rs:989` already worries about exactly that).
+**Result.** New scenario `remote_quic_address_change_scenario`
+(`src/remote/benchmark.rs`, `#[ignore]`, needs root): the in-process server
+runs inside a network namespace, the bridge reaches it over a veth pair, and
+the test deletes the root end's address, types a marker into the dead second,
+and raises a different address 1 s later — real netlink events, a real dead
+source address, a real default-route fallback in between. Two variants:
+`address_change` (only the address moves) and `address_change_port_dead`
+(the namespace also blackholes replies to the client's old UDP port first,
+the design doc's own flap model and the NAT reality it stands for). Design
+doc §8.5 has the table. Summary, debug build, three runs of four flaps per
+variant each, recovery = new address raised → first frame from the server:
 
-**Expected gain.** Interface flap and sleep/wake recovery from ~10 s to under
-1 s (one rebind plus one probe RTT). No change on a quiet path.
+| variant | baseline `6f62d3c6` | with this change |
+| --- | --- | --- |
+| address only | 57–454 ms (median 337) | 11–22 ms (median 13) |
+| old port dead | 13.78–13.81 s (median 13.79) | 11–19 ms (median 14) |
 
-**Measure.** §8.3 "Interface flap" and "Sleep 10 min" rows; add a
-"tether → wifi" row on real hardware. Success: live within 1 s of the address
-event, same connection generation, no reconnect.
+Both are under the preregistered 1 s budget on every flap; the baseline
+misses it on every port-dead flap. Keystroke p50/p95 between flaps is
+unchanged (~11.5 / ~19 ms in both builds), zero lost keystrokes. The
+address-only baseline is fast-ish because a wildcard UDP socket follows the
+kernel's route choice on its own, so recovery there is only quinn's PTO on
+the packets sent into the dead second; the port-dead baseline is the
+`REBIND_AFTER` timer measured from the oldest unanswered probe.
 
-**Risk.** Low. A spurious event costs one rebind and a path validation.
-Rate-limit events to the debounce window; never rebind while a rebind is in
-flight.
+**Not measured here.** Sleep/wake and a real tether → wifi switch on a
+laptop, and the macOS route socket. Those are the field-week items.
+
+**Risk.** Low, as predicted: a spurious announcement costs one route lookup;
+only a changed source costs a rebind and a path validation, at most one per
+500 ms.
 
 ---
 

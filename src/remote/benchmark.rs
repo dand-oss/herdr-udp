@@ -240,6 +240,14 @@ struct BenchServer {
 
 impl BenchServer {
     fn start() -> Self {
+        Self::start_in(None)
+    }
+
+    /// Like [`Self::start`], but the server thread first enters the network
+    /// namespace at `netns` (a file under `/var/run/netns`), so every socket
+    /// the server and its runtime bind lives there. The Unix socket is a
+    /// filesystem object and stays reachable from the root namespace.
+    fn start_in(netns: Option<PathBuf>) -> Self {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
@@ -279,6 +287,9 @@ impl BenchServer {
         let thread = thread::Builder::new()
             .name("quic-bench-server".to_owned())
             .spawn(move || {
+                if let Some(netns) = netns {
+                    enter_network_namespace(&netns);
+                }
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
@@ -394,6 +405,21 @@ impl Drop for BenchServer {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Move the calling thread into the network namespace at `path`. Threads it
+/// spawns afterwards inherit it. Needs `CAP_SYS_ADMIN`.
+fn enter_network_namespace(path: &Path) {
+    use std::os::fd::AsRawFd as _;
+    let file = std::fs::File::open(path).expect("open network namespace");
+    let entered = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
+    assert_eq!(
+        entered,
+        0,
+        "setns({}): {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,6 +1030,514 @@ fn remote_quic_3g_benchmark() {
             blackout.echoed,
             "the keystroke typed during the {} s blackout was never echoed",
             blackout.window.as_secs()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §8.3 interface flap on a real network stack
+// ---------------------------------------------------------------------------
+//
+// The server runs inside a network namespace on `SERVER_ADDRESS`; the bridge
+// stays in the root namespace and reaches it over a veth pair, so the kernel's
+// source-address choice for the server is whatever address the root end of the
+// pair carries. The scenario deletes that address under a live connection and,
+// after `FLAP_GAP`, raises a different one: exactly what a tether -> wifi
+// switch or a DHCP renewal onto a new subnet does, with real netlink
+// announcements and a real dead source address.
+//
+// Two variants, both measured from the moment the new address is raised:
+//
+// * `address_change` — only the address moves. A wildcard socket may follow
+//   the route on its own, so this measures what the kernel gives for free.
+// * `address_change_port_dead` — additionally, the namespace blackholes every
+//   reply to the client's *current* UDP port before the flap. That is the
+//   design doc's own flap model (the old tuple is dead, only a rebind recovers)
+//   and the NAT reality it stands for: a mapping that died with the old path.
+//
+// Needs root. Run the compiled test binary under sudo:
+//
+// ```text
+// cargo test --bin herdr --no-run
+// sudo target/debug/deps/herdr-<hash> --ignored --nocapture remote_quic_address_change_scenario
+// ```
+
+const SCENARIO_NETNS: &str = "herdr-bench";
+const SCENARIO_ROOT_LINK: &str = "hb-root";
+const SCENARIO_NS_LINK: &str = "hb-ns";
+const SERVER_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 253, 1, 2);
+/// The root end starts on the server's subnet and then roams between two
+/// others; the namespace has return routes for all three.
+const CLIENT_ADDRESSES: [Ipv4Addr; 3] = [
+    Ipv4Addr::new(10, 253, 1, 1),
+    Ipv4Addr::new(10, 253, 3, 1),
+    Ipv4Addr::new(10, 253, 4, 1),
+];
+/// Dead time between the old address vanishing and the new one appearing:
+/// a DHCP lease on a new network takes at least this long.
+const FLAP_GAP: Duration = Duration::from_secs(1);
+/// Flaps per variant; each one cycles to the next client address.
+const FLAPS: usize = 4;
+/// Ordinary keystrokes measured after every flap.
+const KEYSTROKES_PER_FLAP: usize = 8;
+/// Preregistered pass rule for the rebind-on-evidence change: the path is
+/// live within this long of the address event.
+const FLAP_RECOVERY_BUDGET: Duration = Duration::from_secs(1);
+
+fn ip(args: &[&str]) {
+    let output = std::process::Command::new("ip")
+        .args(args)
+        .output()
+        .expect("run ip");
+    assert!(
+        output.status.success(),
+        "ip {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn ip_ignore_failure(args: &[&str]) {
+    let _ = std::process::Command::new("ip")
+        .args(args)
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// The veth pair and namespace, torn down on drop.
+struct ScenarioNetwork {
+    /// Index into `CLIENT_ADDRESSES` of the address the root end carries.
+    current: usize,
+}
+
+impl ScenarioNetwork {
+    fn create() -> Self {
+        ip_ignore_failure(&["netns", "del", SCENARIO_NETNS]);
+        ip_ignore_failure(&["link", "del", SCENARIO_ROOT_LINK]);
+        ip(&["netns", "add", SCENARIO_NETNS]);
+        ip(&[
+            "link",
+            "add",
+            SCENARIO_ROOT_LINK,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            SCENARIO_NS_LINK,
+        ]);
+        ip(&["link", "set", SCENARIO_NS_LINK, "netns", SCENARIO_NETNS]);
+        ip(&["link", "set", SCENARIO_ROOT_LINK, "up"]);
+        ip(&["-n", SCENARIO_NETNS, "link", "set", "lo", "up"]);
+        ip(&["-n", SCENARIO_NETNS, "link", "set", SCENARIO_NS_LINK, "up"]);
+        ip(&[
+            "-n",
+            SCENARIO_NETNS,
+            "addr",
+            "add",
+            &format!("{SERVER_ADDRESS}/24"),
+            "dev",
+            SCENARIO_NS_LINK,
+        ]);
+        for address in &CLIENT_ADDRESSES[1..] {
+            let octets = address.octets();
+            let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+            ip(&[
+                "-n",
+                SCENARIO_NETNS,
+                "route",
+                "add",
+                &subnet,
+                "dev",
+                SCENARIO_NS_LINK,
+            ]);
+        }
+        let mut network = Self { current: 0 };
+        network.raise_client_address(0);
+        network
+    }
+
+    fn path() -> PathBuf {
+        PathBuf::from("/var/run/netns").join(SCENARIO_NETNS)
+    }
+
+    fn client_address(&self) -> Ipv4Addr {
+        CLIENT_ADDRESSES[self.current]
+    }
+
+    /// The old address dies: its connected route and every route preferring
+    /// it as source go with it, so the server is unreachable until
+    /// [`Self::raise_client_address`].
+    fn drop_client_address(&self) {
+        ip(&[
+            "addr",
+            "del",
+            &format!("{}/24", self.client_address()),
+            "dev",
+            SCENARIO_ROOT_LINK,
+        ]);
+    }
+
+    /// A new address appears, with a route to the server's subnet that
+    /// prefers it as source (the server's subnet is only directly connected
+    /// for the first address).
+    fn raise_client_address(&mut self, index: usize) {
+        let address = CLIENT_ADDRESSES[index];
+        ip(&[
+            "addr",
+            "add",
+            &format!("{address}/24"),
+            "dev",
+            SCENARIO_ROOT_LINK,
+        ]);
+        if index != 0 {
+            let octets = SERVER_ADDRESS.octets();
+            let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+            ip(&[
+                "route",
+                "replace",
+                &subnet,
+                "dev",
+                SCENARIO_ROOT_LINK,
+                "src",
+                &address.to_string(),
+            ]);
+        }
+        self.current = index;
+    }
+
+    /// From now on the namespace drops every datagram it would send to `port`,
+    /// whatever the destination address: the client's current 4-tuple is dead
+    /// the way a NAT mapping is once the path behind it is gone.
+    fn blackhole_replies_to_port(&self, port: u16) {
+        ip(&[
+            "-n",
+            SCENARIO_NETNS,
+            "rule",
+            "add",
+            "dport",
+            &port.to_string(),
+            "blackhole",
+        ]);
+    }
+}
+
+impl Drop for ScenarioNetwork {
+    fn drop(&mut self) {
+        // Deleting the namespace deletes the veth pair with it (one end is
+        // inside), and the root end's addresses and routes with the link.
+        ip_ignore_failure(&["netns", "del", SCENARIO_NETNS]);
+        ip_ignore_failure(&["link", "del", SCENARIO_ROOT_LINK]);
+    }
+}
+
+/// UDP ports bound by this process in the calling thread's namespace. The
+/// server's sockets live in the scenario namespace, so from the root namespace
+/// this is the bridge's QUIC socket (and nothing else the bench owns).
+fn own_udp_ports() -> Vec<u16> {
+    let mut inodes = std::collections::HashSet::new();
+    for entry in std::fs::read_dir("/proc/self/fd").expect("list own descriptors") {
+        let Ok(entry) = entry else { continue };
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = target.to_string_lossy().into_owned();
+        if let Some(inode) = target
+            .strip_prefix("socket:[")
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            inodes.insert(inode.to_owned());
+        }
+    }
+    let table = std::fs::read_to_string("/proc/net/udp").expect("read /proc/net/udp");
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let local = fields.get(1)?;
+            let inode = fields.get(9)?;
+            if !inodes.contains(*inode) {
+                return None;
+            }
+            let (_, port) = local.rsplit_once(':')?;
+            u16::from_str_radix(port, 16).ok()
+        })
+        .collect()
+}
+
+struct FlapRecord {
+    variant: &'static str,
+    from: Ipv4Addr,
+    to: Ipv4Addr,
+    /// Ports the namespace blackholed before this flap (port-dead variant).
+    dead_ports: Vec<u16>,
+    /// New address raised -> first frame from the server.
+    recovery: Option<Duration>,
+    /// New address raised -> echo of the marker typed while the address was
+    /// dead.
+    echo: Option<Duration>,
+}
+
+impl FlapRecord {
+    fn within_budget(&self) -> bool {
+        self.recovery
+            .is_some_and(|recovery| recovery <= FLAP_RECOVERY_BUDGET)
+    }
+}
+
+fn run_flap(
+    client: &mut TerminalClient,
+    network: &mut ScenarioNetwork,
+    variant: &'static str,
+    index: usize,
+    port_dead: bool,
+    metrics: &mut ArmMetrics,
+) -> FlapRecord {
+    let from = network.client_address();
+    let next = network.current % (CLIENT_ADDRESSES.len() - 1) + 1;
+    let to = CLIENT_ADDRESSES[next];
+    // Digits, so a flap marker can never be confused with a letter marker.
+    let marker = format!("{:0>width$}", index + 1, width = MARKER_LENGTH);
+
+    let dead_ports = if port_dead {
+        let ports = own_udp_ports();
+        assert!(!ports.is_empty(), "the bridge's QUIC socket was not found");
+        for port in &ports {
+            network.blackhole_replies_to_port(*port);
+        }
+        ports
+    } else {
+        Vec::new()
+    };
+
+    network.drop_client_address();
+    let dropped = Instant::now();
+    client.drain_until(dropped + Duration::from_millis(500), metrics);
+    client.send(marker.as_bytes());
+    client.drain_until(dropped + FLAP_GAP, metrics);
+
+    network.raise_client_address(next);
+    let raised = Instant::now();
+    let recovery = client
+        .wait_for_frame(raised + RECOVERY_TIMEOUT, metrics)
+        .map(|at| at.saturating_duration_since(raised));
+    let echo = client
+        .wait_for_marker(&marker, raised + RECOVERY_ECHO_TIMEOUT, metrics)
+        .map(|at| at.saturating_duration_since(raised));
+    if echo.is_none() {
+        metrics.lost += 1;
+    }
+    client.send(&[KILL_LINE]);
+    client.drain_until(Instant::now() + KEYSTROKE_GAP, metrics);
+    FlapRecord {
+        variant,
+        from,
+        to,
+        dead_ports,
+        recovery,
+        echo,
+    }
+}
+
+fn print_flap_report(arms: &[ArmMetrics], flaps: &[FlapRecord]) {
+    println!();
+    println!(
+        "herdr remote QUIC address-change scenario (debug build; {} s dead gap, budget {} ms)",
+        FLAP_GAP.as_secs_f64(),
+        FLAP_RECOVERY_BUDGET.as_millis()
+    );
+    println!(
+        "{:<26} {:>5} {:>9} {:>9} {:>9} {:>5}",
+        "arm", "keys", "p50_ms", "p95_ms", "p99_ms", "lost"
+    );
+    for arm in arms {
+        println!(
+            "{:<26} {:>5} {:>9.1} {:>9.1} {:>9.1} {:>5}",
+            arm.name,
+            arm.latencies.len(),
+            arm.percentile_ms(0.50),
+            arm.percentile_ms(0.95),
+            arm.percentile_ms(0.99),
+            arm.lost,
+        );
+    }
+    println!();
+    println!(
+        "{:<26} {:>3} {:<12} {:<12} {:>12} {:>12} {:>7} {:<12}",
+        "variant", "#", "from", "to", "recovery_ms", "echo_ms", "budget", "dead_ports"
+    );
+    let millis = |value: Option<Duration>| {
+        value
+            .map(|value| format!("{:.1}", value.as_secs_f64() * 1000.0))
+            .unwrap_or_else(|| "n/a".to_owned())
+    };
+    for (index, flap) in flaps.iter().enumerate() {
+        println!(
+            "{:<26} {:>3} {:<12} {:<12} {:>12} {:>12} {:>7} {:<12}",
+            flap.variant,
+            index + 1,
+            flap.from,
+            flap.to,
+            millis(flap.recovery),
+            millis(flap.echo),
+            if flap.within_budget() { "pass" } else { "FAIL" },
+            flap.dead_ports
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    println!();
+}
+
+fn write_flap_json_report(path: &str, arms: &[ArmMetrics], flaps: &[FlapRecord]) {
+    let report = serde_json::json!({
+        "scenario": "address_change",
+        "build": "debug",
+        "flap_gap_seconds": FLAP_GAP.as_secs_f64(),
+        "recovery_budget_ms": FLAP_RECOVERY_BUDGET.as_millis() as u64,
+        "arms": arms
+            .iter()
+            .map(|arm| serde_json::json!({
+                "arm": arm.name,
+                "keystrokes": arm.latencies.len(),
+                "p50_ms": arm.percentile_ms(0.50),
+                "p95_ms": arm.percentile_ms(0.95),
+                "p99_ms": arm.percentile_ms(0.99),
+                "keystrokes_lost": arm.lost,
+            }))
+            .collect::<Vec<_>>(),
+        "flaps": flaps
+            .iter()
+            .map(|flap| serde_json::json!({
+                "variant": flap.variant,
+                "from": flap.from.to_string(),
+                "to": flap.to.to_string(),
+                "dead_ports": flap.dead_ports,
+                "recovery_ms": flap.recovery.map(|value| value.as_secs_f64() * 1000.0),
+                "echo_ms": flap.echo.map(|value| value.as_secs_f64() * 1000.0),
+                "within_budget": flap.within_budget(),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    match std::fs::File::create(path) {
+        Ok(mut file) => {
+            if let Err(err) = writeln!(
+                file,
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_default()
+            ) {
+                eprintln!("herdr bench: cannot write {path}: {err}");
+            }
+        }
+        Err(err) => eprintln!("herdr bench: cannot write {path}: {err}"),
+    }
+}
+
+#[test]
+#[ignore = "scenario: needs root; creates a network namespace and a veth pair"]
+fn remote_quic_address_change_scenario() {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run the test binary under sudo: the scenario creates a network namespace"
+    );
+    // `HERDR_LOG=herdr=debug` shows the bridge's rebinds and the server's
+    // path validation on stderr, timestamped against the report.
+    if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_env("HERDR_LOG") {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init();
+    }
+    let mut network = ScenarioNetwork::create();
+    let mut server = BenchServer::start_in(Some(ScenarioNetwork::path()));
+    let logical_client_id = QuicBridgeConfig::process_logical_client_id();
+    let record = server.bootstrap(logical_client_id);
+    let server_endpoint = SocketAddr::from((SERVER_ADDRESS, record.port));
+    println!(
+        "scenario: server QUIC endpoint {server_endpoint} in netns {SCENARIO_NETNS}, client starts on {}",
+        network.client_address()
+    );
+
+    let bridge_config = QuicBridgeConfig {
+        target: format!("quic-scenario-{}", std::process::id()),
+        remote_herdr: RemoteHerdr::for_test_binary(Path::new("/nonexistent/herdr")),
+        session: crate::session::DEFAULT_SESSION_NAME.to_owned(),
+        ssh_options: None,
+        noninteractive: true,
+        transport: RemoteTransportConfig::Auto,
+        logical_client_id,
+    };
+    seed_credential_for_test(&bridge_config, record.clone(), vec![server_endpoint]);
+    let mut arms = Vec::new();
+    let mut flaps = Vec::new();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for (variant, port_dead) in [
+            ("address_change", false),
+            ("address_change_port_dead", true),
+        ] {
+            let socket = server.root.join(format!("{variant}.sock"));
+            let bridge = bridge_arm(&bridge_config, socket.clone());
+            let mut client = TerminalClient::connect(&socket, &server.terminal_id);
+            client.settle();
+            let mut metrics = ArmMetrics::new(variant);
+            let started = Instant::now();
+            for index in 0..KEYSTROKES_PER_FLAP {
+                measure_keystroke(&mut client, &marker_for(index), &mut metrics);
+            }
+            for flap in 0..FLAPS {
+                flaps.push(run_flap(
+                    &mut client,
+                    &mut network,
+                    variant,
+                    flap,
+                    port_dead,
+                    &mut metrics,
+                ));
+                for index in 0..KEYSTROKES_PER_FLAP {
+                    let marker = marker_for(KEYSTROKES_PER_FLAP * (flap + 1) + index);
+                    measure_keystroke(&mut client, &marker, &mut metrics);
+                }
+            }
+            metrics.wall = started.elapsed();
+            arms.push(metrics);
+            client.close();
+            drop(bridge);
+            // The next arm's bridge dials with a newer credential generation,
+            // which supersedes this arm's connection on the server. Let that
+            // teardown finish before the successor attaches, or the two race.
+            thread::sleep(Duration::from_millis(500));
+        }
+    }));
+
+    forget_credential_for_test(&bridge_config);
+    server.shutdown();
+    drop(network);
+
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+
+    print_flap_report(&arms, &flaps);
+    if let Ok(path) = std::env::var("HERDR_BENCH_REPORT") {
+        write_flap_json_report(&path, &arms, &flaps);
+    }
+
+    assert_eq!(flaps.len(), 2 * FLAPS, "every flap must be measured");
+    for (index, flap) in flaps.iter().enumerate() {
+        assert!(
+            flap.recovery.is_some(),
+            "{} flap {}: no frame arrived after the new address came up",
+            flap.variant,
+            index + 1
+        );
+        assert!(
+            flap.echo.is_some(),
+            "{} flap {}: the keystroke typed while the address was dead was never echoed",
+            flap.variant,
+            index + 1
         );
     }
 }

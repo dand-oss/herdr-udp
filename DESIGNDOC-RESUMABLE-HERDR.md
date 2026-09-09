@@ -300,6 +300,40 @@ one RTT on 3G; the 3G p95/p99 are the deterministic loss events costing a
 retransmit round. fps in the blackout arm is diluted by the 25 s of outage
 inside its wall time.
 
+### 8.5 Address-change scenario (plan item 1)
+
+`src/remote/benchmark.rs` (`#[ignore]`d test `remote_quic_address_change_scenario`,
+needs root) runs the in-process `HeadlessServer` inside a network namespace
+on `10.253.1.2` and the real `QuicBridge` in the root namespace, joined by a
+veth pair. Each flap deletes the root end's address (the server becomes
+unreachable and the kernel's source choice for it falls back to the host's
+default route), types a marker into the dead second, and 1 s later raises a
+different address with a route preferring it as source. Recovery is measured
+from the new address being raised to the first server frame; the marker's
+echo is measured from the same instant. `address_change_port_dead` first
+blackholes every namespace reply to the client's current UDP port (`ip rule
+... dport N blackhole`), which is §8.3's flap model — the old tuple is dead —
+and the NAT-mapping loss it stands for. Four flaps per variant, eight ordinary
+keystrokes before and after each; three runs per build.
+
+Run 2026-09-09, debug builds, `FLAP_GAP` 1 s, budget 1 s; recovery in ms
+over 12 flaps per cell:
+
+| build | variant | recovery min | median | max | budget | keys p50 / p95 ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| `6f62d3c6` (10 s silence timer only) | address_change | 57.0 | 336.5 | 454.0 | 12/12 | 11.5 / 19.7 |
+| `6f62d3c6` | address_change_port_dead | 13779.6 | 13790.8 | 13814.7 | 0/12 | 11.6 / 18.8 |
+| rebind on evidence (plan item 1) | address_change | 11.2 | 13.1 | 21.5 | 12/12 | 11.6 / 17.4 |
+| rebind on evidence | address_change_port_dead | 11.2 | 14.1 | 19.4 | 12/12 | 11.3 / 21.1 |
+
+Zero lost keystrokes in every cell; the marker typed into the dead second was
+echoed within 0.1 ms of recovery every time. The baseline's address-only
+recovery is quinn's PTO on the packets sent while the address was dead — a
+wildcard socket follows the route change by itself — and its port-dead
+recovery is `REBIND_AFTER` counted from the oldest unanswered probe. With the
+watcher, `HERDR_LOG=herdr=info` shows two rebinds per flap: one when the
+source falls back to the default route, one when the new address appears.
+
 ## 9. Source inventory from `feat/resumable-quic`
 
 Cherry-pick files, not commits (commits interleave core and integration).

@@ -83,6 +83,11 @@ const SLOW_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// it *once* per outage strands a sleep -> tether -> wifi sequence on the
 /// second-to-last address.
 const REBIND_AFTER: Duration = Duration::from_secs(10);
+/// Minimum gap between rebinds driven by address-change evidence, so an
+/// interface that flaps several times a second does not thrash the path and
+/// discard congestion state on every flap. A change that lands inside the
+/// window is not lost: it is deferred to the end of the window.
+const REBIND_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Silence after which the path is declared `Lost`. This, not quinn's idle
 /// timeout, is the client's dead-peer bound: the negotiated idle timeout is
 /// the minimum of the two peers' advertised values, so it is the server's
@@ -171,6 +176,13 @@ pub(crate) struct PathMonitor {
     /// Instant of the most recent endpoint rebind, so the next one can be
     /// re-armed a further `REBIND_AFTER` into the same outage.
     rebound_at: Option<Instant>,
+    /// Instant of the most recent rebind driven by address-change evidence.
+    /// Unlike `rebound_at` it survives inbound frames: the debounce bounds
+    /// rebinds per unit of time, not per outage.
+    evidence_rebound_at: Option<Instant>,
+    /// An address change arrived inside the debounce window and still owes
+    /// the path a rebind when the window ends.
+    evidence_rebind_pending: bool,
     state: PathState,
 }
 
@@ -197,8 +209,51 @@ impl PathMonitor {
             unanswered_probes: 0,
             fast_probe_since: None,
             rebound_at: None,
+            evidence_rebound_at: None,
+            evidence_rebind_pending: false,
             state: PathState::Live,
         }
+    }
+
+    /// Records evidence that the local address the path uses changed — the
+    /// kernel announced an address, link, or route change and the source
+    /// address chosen for the peer is no longer the one the connection was
+    /// using — and says whether to rebind right now. `false` inside the
+    /// debounce window means the rebind is deferred, not dropped: the next
+    /// [`Self::on_tick`] at [`Self::next_deadline`] carries it.
+    ///
+    /// Evidence beats the silence timer: a rebind here also re-arms the
+    /// `REBIND_AFTER` fallback, so the timer does not fire a second, redundant
+    /// rebind a few seconds later. `Lost` is terminal and ignores it.
+    pub(crate) fn address_changed(&mut self, now: Instant) -> bool {
+        if self.state == PathState::Lost {
+            return false;
+        }
+        let inside_debounce = self
+            .evidence_rebound_at
+            .and_then(|previous| now.checked_duration_since(previous))
+            .is_some_and(|since| since < REBIND_DEBOUNCE);
+        if inside_debounce {
+            self.evidence_rebind_pending = true;
+            return false;
+        }
+        self.note_evidence_rebind(now);
+        true
+    }
+
+    fn note_evidence_rebind(&mut self, now: Instant) {
+        self.evidence_rebound_at = Some(now);
+        self.evidence_rebind_pending = false;
+        self.rebound_at = Some(now);
+    }
+
+    /// A deferred evidence rebind whose debounce window has ended.
+    fn deferred_rebind_due(&self, now: Instant) -> bool {
+        self.evidence_rebind_pending
+            && self
+                .evidence_rebound_at
+                .and_then(|previous| now.checked_duration_since(previous))
+                .is_none_or(|since| since >= REBIND_DEBOUNCE)
     }
 
     /// Records an inbound frame, whatever it carried, and reports the
@@ -238,6 +293,16 @@ impl PathMonitor {
         };
         if self.state == PathState::Lost {
             return idle;
+        }
+        // A rebind deferred by the debounce is owed before anything else, and
+        // is followed by a probe so the new path proves itself at once.
+        if self.deferred_rebind_due(now) {
+            self.note_evidence_rebind(now);
+            return TickOutcome {
+                probe: true,
+                rebind: true,
+                transition: None,
+            };
         }
         let Some(silence) = self.silence(now) else {
             return TickOutcome {
@@ -295,10 +360,15 @@ impl PathMonitor {
     /// and a quiet healthy path is simply probed again a heartbeat after its
     /// last sign of life.
     pub(crate) fn next_deadline(&self, now: Instant) -> Instant {
-        if self.oldest_unacked_at.is_some() {
+        let liveness = if self.oldest_unacked_at.is_some() {
             self.last_probe_at + self.judge_interval(now)
         } else {
             self.last_signal_at + HEARTBEAT_INTERVAL
+        };
+        match (self.evidence_rebind_pending, self.evidence_rebound_at) {
+            (true, Some(previous)) => liveness.min(previous + REBIND_DEBOUNCE),
+            (true, None) => now,
+            (false, _) => liveness,
         }
     }
 
@@ -477,6 +547,11 @@ impl QuicSession {
     /// only way to follow a local address change (sleep, tether, roam).
     pub(crate) fn rebind(&self) -> Result<(), String> {
         rebind_endpoint(&self.endpoint, self.remote_ip)
+    }
+
+    /// The peer address this connection was established to.
+    pub(crate) fn remote_addr(&self) -> SocketAddr {
+        self.connection.remote_address()
     }
 
     /// Resolves when the connection ends, classifying what the bridge may do.
@@ -827,6 +902,18 @@ fn rebind_endpoint(endpoint: &Endpoint, remote_ip: IpAddr) -> Result<(), String>
     endpoint
         .rebind(socket)
         .map_err(|err| format!("failed to migrate QUIC endpoint: {err}"))
+}
+
+/// The local address the kernel would send from to reach `remote` right now,
+/// or `None` when no route exists. Connecting an unsent UDP socket performs
+/// exactly the route lookup the endpoint's wildcard socket goes through on
+/// every send, without sending anything; comparing two answers is how the
+/// bridge turns a kernel "something changed" announcement into "*my* path
+/// changed".
+pub(crate) fn local_source_for(remote: SocketAddr) -> Option<IpAddr> {
+    let socket = UdpSocket::bind(wildcard_for(remote.ip())).ok()?;
+    socket.connect(remote).ok()?;
+    socket.local_addr().ok().map(|address| address.ip())
 }
 
 /// Local bind address matching the peer's address family: a v4 peer needs a v4
@@ -1382,5 +1469,95 @@ mod tests {
             elapsed < CONNECT_TIMEOUT + DIAL_STAGGER * 5,
             "parallel dial took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn address_change_evidence_rebinds_at_once_and_re_arms_the_silence_timer() {
+        let now = Instant::now();
+        let mut monitor = PathMonitor::new(now);
+        assert!(monitor.on_tick(now).probe);
+        monitor.probe_sent(now);
+
+        // Evidence at +1 s: rebind immediately, no state change.
+        let t1 = now + Duration::from_secs(1);
+        assert!(monitor.address_changed(t1));
+        assert_eq!(monitor.state(), PathState::Live);
+        // The silence-timer rebind is re-armed from the evidence rebind: at
+        // +10 s (REBIND_AFTER after the oldest probe) nothing fires; at
+        // +11 s it does.
+        let t10 = now + REBIND_AFTER;
+        assert!(
+            !monitor.on_tick(t10).rebind,
+            "evidence rebind must re-arm the timer"
+        );
+        let t11 = t1 + REBIND_AFTER;
+        assert!(monitor.on_tick(t11).rebind);
+    }
+
+    #[test]
+    fn address_changes_inside_the_debounce_window_are_deferred_not_dropped() {
+        let now = Instant::now();
+        let mut monitor = PathMonitor::new(now);
+        // A frame just arrived, so the next liveness deadline is a full
+        // heartbeat away and the debounce window is what sets the deadline.
+        assert_eq!(monitor.received(now), None);
+        assert!(monitor.address_changed(now));
+        // A second change 100 ms later is inside the window.
+        let t100 = now + Duration::from_millis(100);
+        assert!(!monitor.address_changed(t100));
+        // The deferred rebind is due at the end of the window, ahead of the
+        // heartbeat.
+        assert_eq!(monitor.next_deadline(t100), now + REBIND_DEBOUNCE);
+        let early = monitor.on_tick(now + Duration::from_millis(400));
+        assert!(
+            !early.rebind,
+            "the debounce must hold until the window ends"
+        );
+        let due = monitor.on_tick(now + REBIND_DEBOUNCE);
+        assert!(
+            due.rebind && due.probe,
+            "the deferred rebind fires with a probe"
+        );
+        assert_eq!(due.transition, None);
+        // Once carried, it is not owed again.
+        let after = monitor.on_tick(now + REBIND_DEBOUNCE + Duration::from_millis(1));
+        assert!(!after.rebind);
+        assert!(
+            monitor.next_deadline(now + REBIND_DEBOUNCE) > now + REBIND_DEBOUNCE,
+            "no deferred rebind must be pending"
+        );
+    }
+
+    #[test]
+    fn address_change_evidence_is_ignored_once_the_path_is_lost() {
+        let now = Instant::now();
+        let mut monitor = PathMonitor::new(now);
+        monitor.probe_sent(now);
+        let gone = monitor.on_tick(now + ROAMING_GRACE);
+        assert_eq!(gone.transition, Some(PathState::Lost));
+        assert!(!monitor.address_changed(now + ROAMING_GRACE + Duration::from_secs(1)));
+        assert!(
+            !monitor
+                .on_tick(now + ROAMING_GRACE + Duration::from_secs(2))
+                .rebind
+        );
+    }
+
+    #[test]
+    fn a_frame_between_two_evidence_rebinds_does_not_reset_the_debounce() {
+        let now = Instant::now();
+        let mut monitor = PathMonitor::new(now);
+        assert!(monitor.address_changed(now));
+        assert_eq!(monitor.received(now + Duration::from_millis(50)), None);
+        assert!(
+            !monitor.address_changed(now + Duration::from_millis(100)),
+            "the debounce bounds rebinds per unit of time, not per outage"
+        );
+    }
+
+    #[test]
+    fn the_local_source_for_loopback_is_loopback() {
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 4433));
+        assert_eq!(local_source_for(v4), Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
     }
 }

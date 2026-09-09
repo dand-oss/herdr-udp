@@ -17,7 +17,7 @@ pub(crate) use super::unix_common::{
     create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,
     remote_private_temp_base, remote_reattach_argument, remote_reattach_program,
     remote_ssh_config_paths, set_default_plugin_pane_pwd, status_commands_supported,
-    wait_client_stream_readable, StatusCommandGuard,
+    wait_client_stream_readable, AddressChangeSource, StatusCommandGuard,
 };
 
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
@@ -830,6 +830,101 @@ fn process_session_id(pid: u32) -> Option<i32> {
     fields.get(3)?.parse().ok()
 }
 
+/// `NETLINK_ROUTE` protocol number; the libc crate does not export it for
+/// glibc targets.
+const NETLINK_ROUTE: libc::c_int = 0;
+/// `struct nlmsghdr` is 16 bytes and every message is padded to 4.
+const NETLINK_HEADER_BYTES: usize = 16;
+const NETLINK_ALIGN: usize = 4;
+
+/// `struct sockaddr_nl` from `<linux/netlink.h>`, which the libc crate does
+/// not define for glibc targets. Layout is fixed ABI.
+#[repr(C)]
+struct NetlinkAddress {
+    family: libc::sa_family_t,
+    pad: u16,
+    pid: u32,
+    groups: u32,
+}
+
+/// Subscribes to the kernel's address, link, and route change announcements.
+///
+/// Only the message type is ever inspected: which interface changed is not
+/// needed, because the caller re-derives the source address its own path
+/// uses and compares. Route groups are included so a new default route
+/// (tether -> wifi keeps the old address for a while) counts as evidence too.
+pub(crate) fn open_address_change_source() -> std::io::Result<AddressChangeSource> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            NETLINK_ROUTE,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a freshly created descriptor nothing else owns.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    let groups = libc::RTMGRP_LINK
+        | libc::RTMGRP_IPV4_IFADDR
+        | libc::RTMGRP_IPV6_IFADDR
+        | libc::RTMGRP_IPV4_ROUTE
+        | libc::RTMGRP_IPV6_ROUTE;
+    let address = NetlinkAddress {
+        family: libc::AF_NETLINK as libc::sa_family_t,
+        pad: 0,
+        pid: 0,
+        groups: groups as u32,
+    };
+    let bound = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&address as *const NetlinkAddress).cast::<libc::sockaddr>(),
+            std::mem::size_of::<NetlinkAddress>() as libc::socklen_t,
+        )
+    };
+    if bound < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(AddressChangeSource::new(
+        fd,
+        netlink_datagram_describes_address_change,
+    ))
+}
+
+/// Walks the `nlmsghdr` chain in one netlink datagram and reports whether any
+/// message announces an address, link, or route change. Control messages
+/// (`NLMSG_DONE`, `NLMSG_ERROR`) and anything malformed are ignored.
+fn netlink_datagram_describes_address_change(datagram: &[u8]) -> bool {
+    let mut rest = datagram;
+    while rest.len() >= NETLINK_HEADER_BYTES {
+        let length = u32::from_ne_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        let kind = u16::from_ne_bytes([rest[4], rest[5]]);
+        if matches!(
+            kind,
+            libc::RTM_NEWLINK
+                | libc::RTM_DELLINK
+                | libc::RTM_NEWADDR
+                | libc::RTM_DELADDR
+                | libc::RTM_NEWROUTE
+                | libc::RTM_DELROUTE
+        ) {
+            return true;
+        }
+        if length < NETLINK_HEADER_BYTES {
+            break;
+        }
+        let advance = length.div_ceil(NETLINK_ALIGN) * NETLINK_ALIGN;
+        if advance > rest.len() {
+            break;
+        }
+        rest = &rest[advance..];
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1604,5 +1699,102 @@ mod tests {
         assert_eq!(argv[1], "-c");
         assert!(argv[2].contains("EDITOR:-vi"));
         assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
+    }
+
+    fn netlink_message(kind: u16, payload_len: usize) -> Vec<u8> {
+        let length = u32::try_from(NETLINK_HEADER_BYTES + payload_len).expect("fits");
+        let mut message = Vec::new();
+        message.extend_from_slice(&length.to_ne_bytes());
+        message.extend_from_slice(&kind.to_ne_bytes());
+        message.extend_from_slice(&0u16.to_ne_bytes());
+        message.extend_from_slice(&0u32.to_ne_bytes());
+        message.extend_from_slice(&0u32.to_ne_bytes());
+        message.extend(std::iter::repeat_n(0xEE, payload_len));
+        while message.len() % NETLINK_ALIGN != 0 {
+            message.push(0);
+        }
+        message
+    }
+
+    #[test]
+    fn netlink_address_and_link_messages_are_address_change_evidence() {
+        const NLMSG_DONE: u16 = 3;
+        for kind in [
+            libc::RTM_NEWLINK,
+            libc::RTM_DELLINK,
+            libc::RTM_NEWADDR,
+            libc::RTM_DELADDR,
+            libc::RTM_NEWROUTE,
+            libc::RTM_DELROUTE,
+        ] {
+            let mut datagram = netlink_message(NLMSG_DONE, 4);
+            datagram.extend(netlink_message(kind, 21));
+            assert!(
+                netlink_datagram_describes_address_change(&datagram),
+                "type {kind} after a control message must count"
+            );
+        }
+        let control_only = netlink_message(NLMSG_DONE, 4);
+        assert!(!netlink_datagram_describes_address_change(&control_only));
+        assert!(!netlink_datagram_describes_address_change(&[]));
+        // A header that claims to be shorter than a header stops the walk
+        // instead of looping, and a truncated tail is ignored.
+        let mut malformed = netlink_message(NLMSG_DONE, 0);
+        malformed[0] = 1;
+        malformed.extend(netlink_message(libc::RTM_NEWADDR, 0));
+        assert!(!netlink_datagram_describes_address_change(&malformed));
+        let truncated = &netlink_message(libc::RTM_NEWADDR, 8)[..NETLINK_HEADER_BYTES - 1];
+        assert!(!netlink_datagram_describes_address_change(truncated));
+    }
+
+    /// Needs `CAP_NET_ADMIN`: run the test binary under `sudo` with
+    /// `--ignored`. Adds and removes an address on a dummy interface and
+    /// expects the source to report evidence for each step.
+    #[test]
+    #[ignore]
+    fn a_real_address_change_is_reported_by_the_netlink_source() {
+        use std::os::fd::AsRawFd as _;
+        const LINK: &str = "herdr-addr0";
+        fn ip(args: &[&str]) {
+            let status = Command::new("ip").args(args).status().expect("run ip");
+            assert!(status.success(), "ip {args:?} failed");
+        }
+        fn readable_within(source: &AddressChangeSource, wait: std::time::Duration) -> bool {
+            let mut descriptor = libc::pollfd {
+                fd: source.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
+            unsafe { libc::poll(&mut descriptor, 1, millis) > 0 }
+        }
+        let source = open_address_change_source().expect("open netlink source");
+        let _ = Command::new("ip").args(["link", "del", LINK]).status();
+        ip(&["link", "add", LINK, "type", "dummy"]);
+        ip(&["link", "set", LINK, "up"]);
+        assert!(readable_within(&source, std::time::Duration::from_secs(2)));
+        assert!(source.drain().expect("drain"), "link add must be evidence");
+        assert!(!source.drain().expect("drain"), "drain must be idempotent");
+
+        ip(&["addr", "add", "10.253.254.1/30", "dev", LINK]);
+        assert!(readable_within(&source, std::time::Duration::from_secs(2)));
+        assert!(
+            source.drain().expect("drain"),
+            "address add must be evidence"
+        );
+
+        ip(&["addr", "del", "10.253.254.1/30", "dev", LINK]);
+        assert!(readable_within(&source, std::time::Duration::from_secs(2)));
+        assert!(
+            source.drain().expect("drain"),
+            "address delete must be evidence"
+        );
+
+        ip(&["link", "del", LINK]);
+        assert!(readable_within(&source, std::time::Duration::from_secs(2)));
+        assert!(
+            source.drain().expect("drain"),
+            "link delete must be evidence"
+        );
     }
 }

@@ -23,14 +23,23 @@
 //! ```text
 //! cargo test --bin herdr -- --ignored --nocapture remote_quic_3g_benchmark
 //! ```
+//!
+//! The relay counts every datagram it sees per direction, before shaping or
+//! loss, so each arm also reports what the two ends put on the wire. Two more
+//! `#[ignore]`d tests share the harness: `remote_quic_idle_traffic` holds an
+//! idle connection with the thin client's health-ping cadence emulated and
+//! reports the packets that cost, and `remote_quic_outage_reconnect_scenario`
+//! drives the real endpoint supervisor through a full outage longer than the
+//! roaming grace and reports how long after the network returns the client is
+//! connected again.
 
 use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -40,10 +49,16 @@ use super::attach::RemoteHerdr;
 use super::quic_bridge::{
     forget_credential_for_test, seed_credential_for_test, QuicBridge, QuicBridgeConfig,
 };
+use crate::client::endpoint::{
+    ClientEndpointId, ClientEndpointStatus, EndpointConnectOptions, EndpointSupervisorEvent,
+    EndpointSupervisors,
+};
 use crate::config::RemoteTransportConfig;
+use crate::protocol::endpoint::{HEALTH_PING_KIND, HEALTH_PONG_KIND, TRANSPORT_STATUS_KIND};
 use crate::protocol::{
-    read_message, write_message, ClientMessage, RemoteBootstrapRecord, RemoteBootstrapRequest,
-    ServerMessage, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    read_message, write_message, ClientMessage, ClientSurfaceSize, RemoteBootstrapRecord,
+    RemoteBootstrapRequest, ServerMessage, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE,
+    PROTOCOL_VERSION,
 };
 
 /// Markers typed per arm. Tail percentiles at the default are dominated by
@@ -74,6 +89,17 @@ const VISIBLE_WINDOW: usize = 8 * 1024;
 const MARKER_LENGTH: usize = 5;
 const CLIENT_COLS: u16 = 100;
 const CLIENT_ROWS: u16 = 30;
+/// How long `remote_quic_idle_traffic` holds the connection open. Override
+/// with `HERDR_BENCH_IDLE_SECONDS`; the design doc's number is a 10 minute
+/// run.
+const DEFAULT_IDLE_SECONDS: u64 = 60;
+/// Outage length for `remote_quic_outage_reconnect_scenario`: the design
+/// doc's "200 s full outage", 50 s past the 150 s roaming grace so the
+/// supervisor has spent several rungs of its ladder when the network returns.
+/// Override with `HERDR_BENCH_OUTAGE_SECONDS`.
+const DEFAULT_OUTAGE_SECONDS: u64 = 200;
+/// The thin client's loop tick, which bounds how late its health ping goes.
+const CLIENT_LOOP_TICK: Duration = Duration::from_millis(100);
 
 // ---------------------------------------------------------------------------
 // Shaping
@@ -108,6 +134,58 @@ const THREE_G_PROFILE: ShapingProfile = ShapingProfile {
     loss_every_nth: Some(101),
 };
 
+/// Datagrams and bytes the relay saw per direction, counted on arrival —
+/// before shaping and before loss — so they are what each end actually put on
+/// the wire, not what the other end received.
+#[derive(Default)]
+struct RelayCounters {
+    up_packets: AtomicU64,
+    up_bytes: AtomicU64,
+    down_packets: AtomicU64,
+    down_bytes: AtomicU64,
+}
+
+impl RelayCounters {
+    fn record(&self, from_server: bool, bytes: usize) {
+        let (packets, total) = if from_server {
+            (&self.down_packets, &self.down_bytes)
+        } else {
+            (&self.up_packets, &self.up_bytes)
+        };
+        packets.fetch_add(1, Ordering::Relaxed);
+        total.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> PacketCount {
+        PacketCount {
+            up_packets: self.up_packets.load(Ordering::Relaxed),
+            up_bytes: self.up_bytes.load(Ordering::Relaxed),
+            down_packets: self.down_packets.load(Ordering::Relaxed),
+            down_bytes: self.down_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Wire traffic between two relay snapshots. `up` is client -> server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PacketCount {
+    up_packets: u64,
+    up_bytes: u64,
+    down_packets: u64,
+    down_bytes: u64,
+}
+
+impl PacketCount {
+    fn since(self, earlier: PacketCount) -> PacketCount {
+        PacketCount {
+            up_packets: self.up_packets.saturating_sub(earlier.up_packets),
+            up_bytes: self.up_bytes.saturating_sub(earlier.up_bytes),
+            down_packets: self.down_packets.saturating_sub(earlier.down_packets),
+            down_bytes: self.down_bytes.saturating_sub(earlier.down_bytes),
+        }
+    }
+}
+
 /// Userspace UDP relay standing in for the WAN hop: one socket, one client at
 /// a time, `server` on the far side. Delay is per datagram and bandwidth is a
 /// per-direction serialization queue, so a burst pays for itself.
@@ -116,6 +194,7 @@ async fn run_udp_proxy(
     server: SocketAddr,
     mode: watch::Receiver<NetworkMode>,
     profile: ShapingProfile,
+    counters: Arc<RelayCounters>,
 ) {
     let mut client = None;
     let mut packet_index = 0u64;
@@ -127,6 +206,7 @@ async fn run_udp_proxy(
             return;
         };
         let from_server = source == server;
+        counters.record(from_server, length);
         let target = if from_server {
             let Some(client) = client else { continue };
             client
@@ -178,6 +258,7 @@ async fn run_udp_proxy(
 struct ShapedRelay {
     address: SocketAddr,
     mode: watch::Sender<NetworkMode>,
+    counters: Arc<RelayCounters>,
     runtime: Option<tokio::runtime::Runtime>,
 }
 
@@ -193,21 +274,30 @@ impl ShapedRelay {
             .expect("bind relay socket");
         let address = socket.local_addr().expect("relay address");
         let (mode, mode_rx) = watch::channel(NetworkMode::Online);
+        let counters = Arc::new(RelayCounters::default());
         runtime.spawn(run_udp_proxy(
             Arc::new(socket),
             server,
             mode_rx,
             THREE_G_PROFILE,
+            Arc::clone(&counters),
         ));
         Self {
             address,
             mode,
+            counters,
             runtime: Some(runtime),
         }
     }
 
     fn set(&self, mode: NetworkMode) {
         let _ = self.mode.send(mode);
+    }
+
+    /// Everything the relay has seen so far; subtract an earlier snapshot to
+    /// account one arm.
+    fn packets(&self) -> PacketCount {
+        self.counters.snapshot()
     }
 }
 
@@ -652,6 +742,9 @@ struct ArmMetrics {
     frame_bytes: u64,
     lost: u64,
     wall: Duration,
+    /// Datagrams the relay saw during the measured part of the arm. Zero for
+    /// the direct arm, which has no relay.
+    packets: PacketCount,
 }
 
 impl ArmMetrics {
@@ -663,6 +756,7 @@ impl ArmMetrics {
             frame_bytes: 0,
             lost: 0,
             wall: Duration::ZERO,
+            packets: PacketCount::default(),
         }
     }
 
@@ -815,7 +909,7 @@ fn print_report(arms: &[ArmMetrics], blackouts: &[BlackoutRecord], keystrokes: u
     println!();
     println!("herdr remote QUIC 3G benchmark (debug build; bytes are Terminal frame payloads)");
     println!(
-        "{:<18} {:>5} {:>9} {:>9} {:>9} {:>7} {:>12} {:>12} {:>5} {:>8}",
+        "{:<18} {:>5} {:>9} {:>9} {:>9} {:>7} {:>12} {:>12} {:>5} {:>8} {:>8} {:>8}",
         "arm",
         "keys",
         "p50_ms",
@@ -825,11 +919,13 @@ fn print_report(arms: &[ArmMetrics], blackouts: &[BlackoutRecord], keystrokes: u
         "bytes/frame",
         "total_bytes",
         "lost",
-        "wall_s"
+        "wall_s",
+        "pkts_up",
+        "pkts_dn"
     );
     for arm in arms {
         println!(
-            "{:<18} {:>5} {:>9.1} {:>9.1} {:>9.1} {:>7.2} {:>12.1} {:>12} {:>5} {:>8.1}",
+            "{:<18} {:>5} {:>9.1} {:>9.1} {:>9.1} {:>7.2} {:>12.1} {:>12} {:>5} {:>8.1} {:>8} {:>8}",
             arm.name,
             keystrokes,
             arm.percentile_ms(0.50),
@@ -840,6 +936,8 @@ fn print_report(arms: &[ArmMetrics], blackouts: &[BlackoutRecord], keystrokes: u
             arm.frame_bytes,
             arm.lost,
             arm.wall.as_secs_f64(),
+            arm.packets.up_packets,
+            arm.packets.down_packets,
         );
     }
     println!();
@@ -878,6 +976,10 @@ fn write_json_report(path: &str, arms: &[ArmMetrics], blackouts: &[BlackoutRecor
                 "frames": arm.frames,
                 "keystrokes_lost": arm.lost,
                 "wall_seconds": arm.wall.as_secs_f64(),
+                "packets_up": arm.packets.up_packets,
+                "packets_down": arm.packets.down_packets,
+                "bytes_up": arm.packets.up_bytes,
+                "bytes_down": arm.packets.down_bytes,
             }))
             .collect::<Vec<_>>(),
         "blackouts": blackouts
@@ -891,20 +993,7 @@ fn write_json_report(path: &str, arms: &[ArmMetrics], blackouts: &[BlackoutRecor
             }))
             .collect::<Vec<_>>(),
     });
-    let mut file = match std::fs::File::create(path) {
-        Ok(file) => file,
-        Err(err) => {
-            eprintln!("herdr bench: cannot write {path}: {err}");
-            return;
-        }
-    };
-    if let Err(err) = writeln!(
-        file,
-        "{}",
-        serde_json::to_string_pretty(&report).unwrap_or_default()
-    ) {
-        eprintln!("herdr bench: cannot write {path}: {err}");
-    }
+    write_json_file(path, &report);
 }
 
 // ---------------------------------------------------------------------------
@@ -934,6 +1023,7 @@ fn bridge_arm(config: &QuicBridgeConfig, socket: PathBuf) -> QuicBridge {
 #[test]
 #[ignore = "benchmark: drives a real server, bridge, and shaped relay for minutes"]
 fn remote_quic_3g_benchmark() {
+    init_bench_logging();
     let count = keystrokes();
     let mut server = BenchServer::start();
     let logical_client_id = QuicBridgeConfig::process_logical_client_id();
@@ -976,7 +1066,10 @@ fn remote_quic_3g_benchmark() {
             let bridge = bridge_arm(&bridge_config, socket.clone());
             let mut client = TerminalClient::connect(&socket, &server.terminal_id);
             client.settle();
-            arms.push(measure_arm(name, &mut client, count));
+            let before = relay.packets();
+            let mut metrics = measure_arm(name, &mut client, count);
+            metrics.packets = relay.packets().since(before);
+            arms.push(metrics);
             client.close();
             drop(bridge);
         }
@@ -986,12 +1079,14 @@ fn remote_quic_3g_benchmark() {
         let bridge = bridge_arm(&bridge_config, socket.clone());
         let mut client = TerminalClient::connect(&socket, &server.terminal_id);
         client.settle();
-        let (metrics, records) = measure_blackout_arm(
+        let before = relay.packets();
+        let (mut metrics, records) = measure_blackout_arm(
             &mut client,
             &relay,
             count,
             &[Duration::from_secs(5), Duration::from_secs(20)],
         );
+        metrics.packets = relay.packets().since(before);
         arms.push(metrics);
         blackouts = records;
         client.close();
@@ -1032,6 +1127,757 @@ fn remote_quic_3g_benchmark() {
             blackout.window.as_secs()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Supervised endpoint: the thin client's own connect path
+// ---------------------------------------------------------------------------
+//
+// The idle and outage tests need what a saved-machine connection really is:
+// the thin client's endpoint supervisor connecting through the bridge with the
+// semantic-shell handshake, since only a shell client is answered with health
+// pongs and only the supervisor paces reconnects. Everything below the loop is
+// the real code; what the thin client's event loop would do with the frames it
+// reads — book any message as liveness, count pongs, hand transport hints to
+// the supervisor, report a closed socket — is done here in a few lines.
+
+/// `HERDR_LOG=herdr=debug` shows the bridge's ladder, probes, and rebinds and
+/// the server's side on stderr, timestamped against the report. Silent
+/// without the variable, exactly like the binary.
+fn init_bench_logging() {
+    if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_env("HERDR_LOG") {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init();
+    }
+}
+
+fn env_seconds(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(default)
+}
+
+enum EndpointReaderEvent {
+    TransportStatus { generation: u64, state: String },
+    Closed { generation: u64 },
+}
+
+/// One connection the supervisor handed over: its writer, kept alive because
+/// dropping it ends the connection, and the reader thread's bookkeeping.
+struct SupervisedConnection {
+    writer: crate::client::endpoint::NativeEndpointTransport,
+    last_received: Arc<Mutex<Instant>>,
+    pongs: Arc<AtomicU64>,
+    /// The reader thread's own duplicate of the socket, shut down at close so
+    /// the blocking read returns.
+    socket: UnixStream,
+    reader: Option<JoinHandle<()>>,
+}
+
+/// Read a connected endpoint's frames the way the thin client's reader does,
+/// reporting the bridge's transport hints and the end of the stream. The
+/// handshake leaves the socket non-blocking for the client's event loop; this
+/// thread reads it blocking.
+fn spawn_endpoint_reader(
+    reader: crate::ipc::LocalStream,
+    generation: u64,
+    events: mpsc::Sender<EndpointReaderEvent>,
+    last_received: Arc<Mutex<Instant>>,
+    pongs: Arc<AtomicU64>,
+) -> (UnixStream, JoinHandle<()>) {
+    let crate::ipc::LocalStream::UdSocket(reader) = reader;
+    let mut reader = UnixStream::from(std::os::fd::OwnedFd::from(reader));
+    reader
+        .set_nonblocking(false)
+        .expect("blocking endpoint reader");
+    reader
+        .set_read_timeout(None)
+        .expect("endpoint reader without timeout");
+    let handle = reader.try_clone().expect("clone endpoint reader");
+    let thread = thread::Builder::new()
+        .name(format!("quic-bench-endpoint-{generation}"))
+        .spawn(move || loop {
+            let message: ServerMessage = match read_message(&mut reader, MAX_GRAPHICS_FRAME_SIZE) {
+                Ok(message) => message,
+                Err(err) => {
+                    println!("endpoint {generation}: reader stopped: {err}");
+                    let _ = events.send(EndpointReaderEvent::Closed { generation });
+                    return;
+                }
+            };
+            if let Ok(mut last) = last_received.lock() {
+                *last = Instant::now();
+            }
+            if let ServerMessage::EndpointControl { kind, data } = message {
+                if kind == HEALTH_PONG_KIND {
+                    pongs.fetch_add(1, Ordering::Relaxed);
+                } else if kind == TRANSPORT_STATUS_KIND {
+                    #[derive(serde::Deserialize)]
+                    struct TransportStatus {
+                        state: String,
+                    }
+                    if let Ok(status) = serde_json::from_str::<TransportStatus>(&data) {
+                        let _ = events.send(EndpointReaderEvent::TransportStatus {
+                            generation,
+                            state: status.state,
+                        });
+                    }
+                }
+            }
+        })
+        .expect("spawn endpoint reader");
+    (handle, thread)
+}
+
+/// What the thin client's loop does with a transport status hint: only the
+/// reconnect hint reaches the supervisor.
+fn apply_transport_hint(
+    supervisors: &mut EndpointSupervisors,
+    endpoint_id: &ClientEndpointId,
+    generation: u64,
+    state: &str,
+) -> bool {
+    state == "reconnect-fast" && supervisors.expect_fast_reconnect(endpoint_id, generation)
+}
+
+/// What one supervisor tick produced.
+enum SupervisedEvent {
+    Connected {
+        generation: u64,
+    },
+    Failed {
+        status: ClientEndpointStatus,
+        message: String,
+    },
+    Hint {
+        generation: u64,
+        state: String,
+        applied: bool,
+    },
+    Closed {
+        generation: u64,
+    },
+}
+
+/// The thin client's supervisor driving one Local endpoint at the bridge's
+/// socket, ticked by the caller on the client's own 100 ms loop cadence.
+struct SupervisedEndpoint {
+    started: Instant,
+    endpoint_id: ClientEndpointId,
+    options: EndpointConnectOptions,
+    supervisors: EndpointSupervisors,
+    event_tx: tokio::sync::mpsc::Sender<EndpointSupervisorEvent>,
+    events: tokio::sync::mpsc::Receiver<EndpointSupervisorEvent>,
+    reader_tx: mpsc::Sender<EndpointReaderEvent>,
+    reader_rx: mpsc::Receiver<EndpointReaderEvent>,
+    connections: Vec<SupervisedConnection>,
+}
+
+impl SupervisedEndpoint {
+    fn new(socket: PathBuf) -> Self {
+        let started = Instant::now();
+        let mut supervisors = EndpointSupervisors::new(&[], started);
+        supervisors.add_local(socket, None, started);
+        let (event_tx, events) = tokio::sync::mpsc::channel(16);
+        let (reader_tx, reader_rx) = mpsc::channel();
+        Self {
+            started,
+            endpoint_id: ClientEndpointId::Local,
+            options: EndpointConnectOptions {
+                cols: CLIENT_COLS,
+                rows: CLIENT_ROWS,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                pixel_geometry_exact: false,
+                surface_size: ClientSurfaceSize {
+                    cols: CLIENT_COLS,
+                    rows: CLIENT_ROWS,
+                },
+                endpoint_keybindings: false,
+                mouse_capture: false,
+            },
+            supervisors,
+            event_tx,
+            events,
+            reader_tx,
+            reader_rx,
+            connections: Vec::new(),
+        }
+    }
+
+    fn elapsed(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+
+    /// One loop tick: start any due connection attempt, then collect what the
+    /// reader threads and the supervisor reported, waiting up to a client
+    /// tick for the latter.
+    async fn tick(&mut self) -> Vec<SupervisedEvent> {
+        let now = Instant::now();
+        self.supervisors
+            .spawn_due(now, self.options, &self.event_tx);
+        let mut produced = Vec::new();
+        while let Ok(event) = self.reader_rx.try_recv() {
+            match event {
+                EndpointReaderEvent::TransportStatus { generation, state } => {
+                    let applied = apply_transport_hint(
+                        &mut self.supervisors,
+                        &self.endpoint_id,
+                        generation,
+                        &state,
+                    );
+                    println!(
+                        "endpoint {generation}: bridge said {state:?} (applied: {applied}) at +{:.1} s",
+                        self.elapsed()
+                    );
+                    produced.push(SupervisedEvent::Hint {
+                        generation,
+                        state,
+                        applied,
+                    });
+                }
+                EndpointReaderEvent::Closed { generation } => {
+                    if self
+                        .supervisors
+                        .disconnected(&self.endpoint_id, generation, Instant::now())
+                    {
+                        println!("endpoint {generation}: closed at +{:.1} s", self.elapsed());
+                        produced.push(SupervisedEvent::Closed { generation });
+                    }
+                }
+            }
+        }
+        match tokio::time::timeout(CLIENT_LOOP_TICK, self.events.recv()).await {
+            Ok(Some(EndpointSupervisorEvent::Connected {
+                generation,
+                reader,
+                writer,
+                ..
+            })) => {
+                println!(
+                    "endpoint {generation}: connected at +{:.1} s",
+                    self.elapsed()
+                );
+                self.supervisors.record_status(
+                    &self.endpoint_id,
+                    generation,
+                    ClientEndpointStatus::Online,
+                    Instant::now(),
+                );
+                let last_received = Arc::new(Mutex::new(Instant::now()));
+                let pongs = Arc::new(AtomicU64::new(0));
+                let (socket, reader) = spawn_endpoint_reader(
+                    reader,
+                    generation,
+                    self.reader_tx.clone(),
+                    Arc::clone(&last_received),
+                    Arc::clone(&pongs),
+                );
+                self.connections.push(SupervisedConnection {
+                    writer,
+                    last_received,
+                    pongs,
+                    socket,
+                    reader: Some(reader),
+                });
+                produced.push(SupervisedEvent::Connected { generation });
+            }
+            Ok(Some(EndpointSupervisorEvent::Status {
+                generation,
+                status,
+                message,
+                ..
+            })) => {
+                println!(
+                    "endpoint {generation}: attempt ended {status:?} ({message}) at +{:.1} s",
+                    self.elapsed()
+                );
+                if self.supervisors.record_status(
+                    &self.endpoint_id,
+                    generation,
+                    status,
+                    Instant::now(),
+                ) {
+                    produced.push(SupervisedEvent::Failed { status, message });
+                }
+            }
+            Ok(None) => panic!("supervisor event channel closed"),
+            Err(_) => {}
+        }
+        produced
+    }
+
+    /// Tick until the supervisor hands over a connection.
+    async fn wait_connected(&mut self, deadline: Instant) -> u64 {
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no endpoint connection before the deadline"
+            );
+            for event in self.tick().await {
+                match event {
+                    SupervisedEvent::Connected { generation } => return generation,
+                    SupervisedEvent::Failed {
+                        status, message, ..
+                    } => assert_ne!(
+                        status,
+                        ClientEndpointStatus::Attention,
+                        "the supervisor gave up: {message}"
+                    ),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn latest(&mut self) -> &mut SupervisedConnection {
+        self.connections
+            .last_mut()
+            .expect("a supervised connection")
+    }
+
+    fn close(mut self) {
+        let connections = std::mem::take(&mut self.connections);
+        for mut connection in connections {
+            drop(connection.writer);
+            let _ = connection.socket.shutdown(std::net::Shutdown::Both);
+            if let Some(reader) = connection.reader.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+}
+
+impl SupervisedConnection {
+    fn last_received(&self) -> Instant {
+        self.last_received
+            .lock()
+            .map(|last| *last)
+            .unwrap_or_else(|_| Instant::now())
+    }
+
+    fn pongs(&self) -> u64 {
+        self.pongs.load(Ordering::Relaxed)
+    }
+
+    /// The thin client's own health ping, byte for byte.
+    fn send_health_ping(&mut self) {
+        use crate::client::endpoint::EndpointTransport as _;
+        self.writer
+            .send(&ClientMessage::EndpointControl {
+                kind: HEALTH_PING_KIND.to_owned(),
+                data: String::new(),
+            })
+            .expect("queue health ping");
+    }
+}
+
+fn bench_server_and_bridge_config() -> (
+    BenchServer,
+    RemoteBootstrapRecord,
+    ShapedRelay,
+    QuicBridgeConfig,
+) {
+    let server = BenchServer::start();
+    let logical_client_id = QuicBridgeConfig::process_logical_client_id();
+    let record = server.bootstrap(logical_client_id);
+    let relay = ShapedRelay::start(SocketAddr::from((Ipv4Addr::LOCALHOST, record.port)));
+    let bridge_config = QuicBridgeConfig {
+        target: format!("quic-bench-{}", std::process::id()),
+        remote_herdr: RemoteHerdr::for_test_binary(Path::new("/nonexistent/herdr")),
+        session: crate::session::DEFAULT_SESSION_NAME.to_owned(),
+        ssh_options: None,
+        noninteractive: true,
+        transport: RemoteTransportConfig::Auto,
+        logical_client_id,
+    };
+    seed_credential_for_test(&bridge_config, record.clone(), vec![relay.address]);
+    (server, record, relay, bridge_config)
+}
+
+fn write_json_file(path: &str, report: &serde_json::Value) {
+    let mut file = match std::fs::File::create(path) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("herdr bench: cannot write {path}: {err}");
+            return;
+        }
+    };
+    if let Err(err) = writeln!(
+        file,
+        "{}",
+        serde_json::to_string_pretty(report).unwrap_or_default()
+    ) {
+        eprintln!("herdr bench: cannot write {path}: {err}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idle traffic (plan item 2B)
+// ---------------------------------------------------------------------------
+
+struct IdleRecord {
+    held: Duration,
+    packets: PacketCount,
+    client_pings: u64,
+    pongs: u64,
+}
+
+impl IdleRecord {
+    fn per_minute(&self, packets: u64) -> f64 {
+        if self.held.is_zero() {
+            return 0.0;
+        }
+        packets as f64 * 60.0 / self.held.as_secs_f64()
+    }
+}
+
+/// Hold the supervised connection idle for `held`, sending the thin client's
+/// health ping on its exact schedule: 5 s after the last message received,
+/// checked on a 100 ms tick, one ping outstanding at a time. Every ping must
+/// come back as a pong, which is also the proof that the path stayed live
+/// without any other traffic.
+async fn drive_idle(relay: &ShapedRelay, socket: PathBuf, held: Duration) -> IdleRecord {
+    let mut endpoint = SupervisedEndpoint::new(socket);
+    let generation = endpoint
+        .wait_connected(Instant::now() + Duration::from_secs(30))
+        .await;
+    tokio::time::sleep(SETTLE).await;
+
+    let before = relay.packets();
+    let pongs_before = endpoint.latest().pongs();
+    let started = Instant::now();
+    let mut ping_sent_at: Option<Instant> = None;
+    let mut client_pings = 0u64;
+    while started.elapsed() < held {
+        for event in endpoint.tick().await {
+            match event {
+                SupervisedEvent::Closed { generation: closed } if closed == generation => {
+                    panic!(
+                        "the idle connection closed at +{:.1} s",
+                        started.elapsed().as_secs_f64()
+                    )
+                }
+                SupervisedEvent::Connected { .. } => panic!("an unexpected second connection"),
+                _ => {}
+            }
+        }
+        let connection = endpoint.latest();
+        let last_received = connection.last_received();
+        if ping_sent_at.is_some_and(|sent_at| last_received > sent_at) {
+            ping_sent_at = None;
+        }
+        if ping_sent_at.is_none()
+            && last_received.elapsed() >= crate::client::endpoint::health::HEARTBEAT_INTERVAL
+        {
+            connection.send_health_ping();
+            ping_sent_at = Some(Instant::now());
+            client_pings += 1;
+        }
+    }
+    // Let the last pong land before counting.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let record = IdleRecord {
+        held: started.elapsed(),
+        packets: relay.packets().since(before),
+        client_pings,
+        pongs: endpoint.latest().pongs() - pongs_before,
+    };
+    endpoint.close();
+    record
+}
+
+fn print_idle_report(record: &IdleRecord) {
+    println!();
+    println!("herdr remote QUIC idle traffic (debug build; relay in online mode)");
+    println!(
+        "held {:.1} s: {} packets up ({:.1}/min, {} bytes), {} packets down ({:.1}/min, {} bytes); client pings {} pongs {}",
+        record.held.as_secs_f64(),
+        record.packets.up_packets,
+        record.per_minute(record.packets.up_packets),
+        record.packets.up_bytes,
+        record.packets.down_packets,
+        record.per_minute(record.packets.down_packets),
+        record.packets.down_bytes,
+        record.client_pings,
+        record.pongs,
+    );
+    println!();
+}
+
+fn write_idle_json_report(path: &str, record: &IdleRecord) {
+    let report = serde_json::json!({
+        "build": "debug",
+        "held_seconds": record.held.as_secs_f64(),
+        "packets_up": record.packets.up_packets,
+        "bytes_up": record.packets.up_bytes,
+        "packets_down": record.packets.down_packets,
+        "bytes_down": record.packets.down_bytes,
+        "packets_up_per_minute": record.per_minute(record.packets.up_packets),
+        "packets_down_per_minute": record.per_minute(record.packets.down_packets),
+        "client_pings": record.client_pings,
+        "pongs": record.pongs,
+    });
+    write_json_file(path, &report);
+}
+
+/// What an idle saved-machine connection costs on the wire: the thin client
+/// pings every 5 s, the bridge probes on its own schedule, and the server may
+/// keep alive on top. The relay counts all of it.
+#[test]
+#[ignore = "benchmark: holds a real bridge connection idle for a minute or more"]
+fn remote_quic_idle_traffic() {
+    init_bench_logging();
+    let held = Duration::from_secs(env_seconds(
+        "HERDR_BENCH_IDLE_SECONDS",
+        DEFAULT_IDLE_SECONDS,
+    ));
+    let (mut server, _record, relay, bridge_config) = bench_server_and_bridge_config();
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        relay.set(NetworkMode::Online);
+        let socket = server.root.join("quic_idle.sock");
+        let bridge = bridge_arm(&bridge_config, socket.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("idle runtime");
+        let record = runtime.block_on(drive_idle(&relay, socket, held));
+        drop(bridge);
+        record
+    }));
+
+    forget_credential_for_test(&bridge_config);
+    drop(relay);
+    server.shutdown();
+
+    let record = match outcome {
+        Ok(record) => record,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    print_idle_report(&record);
+    if let Ok(path) = std::env::var("HERDR_BENCH_REPORT") {
+        write_idle_json_report(&path, &record);
+    }
+    assert!(record.client_pings > 0, "the idle hold sent no client ping");
+    assert_eq!(
+        record.pongs, record.client_pings,
+        "every client ping must be answered while idle"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Full outage past the roaming grace (plan item 2A)
+// ---------------------------------------------------------------------------
+
+struct OutageRecord {
+    outage: Duration,
+    /// From the start of the outage to the bridge closing the local socket.
+    lost_after: Option<Duration>,
+    /// Transport status states the bridge sent on the connection it closed.
+    hints: Vec<String>,
+    /// Reconnect attempts that failed, as seconds after the connection was
+    /// lost.
+    failed_attempts: Vec<Duration>,
+    /// From the relay reopening to the supervisor reporting a connection.
+    restore_to_connected: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutagePhase {
+    Live { since: Instant },
+    Outage { started: Instant },
+    Restored { at: Instant },
+    Done,
+}
+
+async fn drive_outage(relay: &ShapedRelay, socket: PathBuf, outage: Duration) -> OutageRecord {
+    let mut endpoint = SupervisedEndpoint::new(socket);
+    let started = Instant::now();
+    let deadline = started + outage + Duration::from_secs(120);
+    let first = endpoint.wait_connected(deadline).await;
+    let mut phase = OutagePhase::Live {
+        since: Instant::now(),
+    };
+    let mut record = OutageRecord {
+        outage,
+        lost_after: None,
+        hints: Vec::new(),
+        failed_attempts: Vec::new(),
+        restore_to_connected: None,
+    };
+    let mut lost_at = None;
+
+    while phase != OutagePhase::Done {
+        let now = Instant::now();
+        assert!(now < deadline, "outage scenario timed out in {phase:?}");
+        match phase {
+            OutagePhase::Live { since } if now >= since + SETTLE => {
+                relay.set(NetworkMode::Blackhole);
+                println!("outage: relay closed at +{:.1} s", endpoint.elapsed());
+                phase = OutagePhase::Outage { started: now };
+            }
+            OutagePhase::Outage {
+                started: outage_started,
+            } if now >= outage_started + outage => {
+                relay.set(NetworkMode::Online);
+                println!("outage: relay reopened at +{:.1} s", endpoint.elapsed());
+                phase = OutagePhase::Restored { at: now };
+            }
+            _ => {}
+        }
+        for event in endpoint.tick().await {
+            let now = Instant::now();
+            match event {
+                SupervisedEvent::Hint {
+                    generation,
+                    state,
+                    applied,
+                } if generation == first => record.hints.push(if applied {
+                    format!("{state} (applied)")
+                } else {
+                    state
+                }),
+                SupervisedEvent::Hint { .. } => {}
+                SupervisedEvent::Closed { generation } if generation == first => {
+                    if let OutagePhase::Outage {
+                        started: outage_started,
+                    } = phase
+                    {
+                        lost_at = Some(now);
+                        record.lost_after = Some(now - outage_started);
+                    } else {
+                        panic!("the connection closed outside the outage, in {phase:?}");
+                    }
+                }
+                SupervisedEvent::Closed { .. } => {}
+                SupervisedEvent::Failed { status, message } => {
+                    assert_ne!(
+                        status,
+                        ClientEndpointStatus::Attention,
+                        "the supervisor gave up: {message}"
+                    );
+                    if let Some(lost_at) = lost_at {
+                        record.failed_attempts.push(now - lost_at);
+                    }
+                }
+                SupervisedEvent::Connected { .. } => {
+                    phase = match phase {
+                        OutagePhase::Restored { at } => {
+                            record.restore_to_connected = Some(now - at);
+                            OutagePhase::Done
+                        }
+                        other => panic!("connected during {other:?}"),
+                    };
+                }
+            }
+        }
+    }
+    endpoint.close();
+    record
+}
+
+fn print_outage_report(record: &OutageRecord) {
+    println!();
+    println!("herdr remote QUIC outage reconnect scenario (debug build; relay in online mode)");
+    println!(
+        "outage {} s; lost after {}; hints on the closed connection: [{}]",
+        record.outage.as_secs(),
+        record
+            .lost_after
+            .map(|lost| format!("{:.1} s", lost.as_secs_f64()))
+            .unwrap_or_else(|| "never".to_owned()),
+        record.hints.join(", "),
+    );
+    println!(
+        "failed reconnect attempts after loss at: [{}] s",
+        record
+            .failed_attempts
+            .iter()
+            .map(|at| format!("{:.1}", at.as_secs_f64()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "restore -> connected: {}",
+        record
+            .restore_to_connected
+            .map(|delay| format!("{:.2} s", delay.as_secs_f64()))
+            .unwrap_or_else(|| "never".to_owned())
+    );
+    println!();
+}
+
+fn write_outage_json_report(path: &str, record: &OutageRecord) {
+    let report = serde_json::json!({
+        "build": "debug",
+        "outage_seconds": record.outage.as_secs(),
+        "lost_after_seconds": record.lost_after.map(|lost| lost.as_secs_f64()),
+        "hints": record.hints,
+        "failed_attempts_after_loss_seconds": record
+            .failed_attempts
+            .iter()
+            .map(|at| at.as_secs_f64())
+            .collect::<Vec<_>>(),
+        "restore_to_connected_seconds": record
+            .restore_to_connected
+            .map(|delay| delay.as_secs_f64()),
+    });
+    write_json_file(path, &report);
+}
+
+/// The design doc's "200 s full outage": how long after the network returns
+/// the client is connected again, with the real supervisor pacing the real
+/// bridge's ladder.
+#[test]
+#[ignore = "benchmark: runs an outage longer than the roaming grace, several minutes"]
+fn remote_quic_outage_reconnect_scenario() {
+    init_bench_logging();
+    let outage = Duration::from_secs(env_seconds(
+        "HERDR_BENCH_OUTAGE_SECONDS",
+        DEFAULT_OUTAGE_SECONDS,
+    ));
+    let (mut server, _record, relay, bridge_config) = bench_server_and_bridge_config();
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        relay.set(NetworkMode::Online);
+        let socket = server.root.join("quic_outage.sock");
+        let bridge = bridge_arm(&bridge_config, socket.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("scenario runtime");
+        let record = runtime.block_on(drive_outage(&relay, socket, outage));
+        drop(bridge);
+        record
+    }));
+
+    forget_credential_for_test(&bridge_config);
+    drop(relay);
+    server.shutdown();
+
+    let record = match outcome {
+        Ok(record) => record,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    print_outage_report(&record);
+    if let Ok(path) = std::env::var("HERDR_BENCH_REPORT") {
+        write_outage_json_report(&path, &record);
+    }
+    assert!(
+        record.lost_after.is_some(),
+        "the bridge never gave the connection up during a {} s outage",
+        outage.as_secs()
+    );
+    assert!(
+        record.restore_to_connected.is_some(),
+        "the client never reconnected after the relay reopened"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1442,15 +2288,7 @@ fn remote_quic_address_change_scenario() {
         0,
         "run the test binary under sudo: the scenario creates a network namespace"
     );
-    // `HERDR_LOG=herdr=debug` shows the bridge's rebinds and the server's
-    // path validation on stderr, timestamped against the report.
-    if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_env("HERDR_LOG") {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .with_ansi(false)
-            .try_init();
-    }
+    init_bench_logging();
     let mut network = ScenarioNetwork::create();
     let mut server = BenchServer::start_in(Some(ScenarioNetwork::path()));
     let logical_client_id = QuicBridgeConfig::process_logical_client_id();

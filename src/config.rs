@@ -10,6 +10,8 @@ mod theme;
 mod window_title;
 mod write;
 
+#[cfg(all(unix, test))]
+pub use self::model::REMOTE_TRANSPORT_IDLE_TIMEOUT_MIN_SECONDS;
 #[cfg(unix)]
 pub use self::model::{RemoteTransportConfig, REMOTE_TRANSPORT_IDLE_TIMEOUT_MAX_SECONDS};
 pub use self::{

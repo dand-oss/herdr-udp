@@ -1837,6 +1837,10 @@ async fn run_client_loop(
                                 }
                                 continue;
                             }
+                            Ok(endpoint::EndpointControlMessage::TransportReconnectFast) => {
+                                supervisors.expect_fast_reconnect(&endpoint_id, generation);
+                                continue;
+                            }
                             Ok(endpoint::EndpointControlMessage::Ignored) => {
                                 debug!(%kind, "ignoring unknown endpoint control message");
                                 continue;

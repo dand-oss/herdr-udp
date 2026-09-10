@@ -10,6 +10,14 @@ use interprocess::TryClone as _;
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Retry cap after the local transport bridge reported that the connection
+/// it closed can be re-dialed on a credential that already carried a
+/// session. Such a reconnect is one UDP dial, no SSH, so the cost of retrying
+/// often is a handful of small packets, and the cost of not doing so is the
+/// tail of the 30 s ladder after the network is back. SSH endpoints and
+/// bridges holding an unproven credential never send the hint and keep
+/// [`MAX_RETRY_DELAY`].
+const FAST_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Copy)]
 pub(crate) struct EndpointConnectOptions {
@@ -51,6 +59,9 @@ struct ReconnectState {
     next_attempt: Option<Instant>,
     in_flight: bool,
     generation: Option<u64>,
+    /// The bridge said the next episode is a cheap re-dial: cap the backoff
+    /// at [`FAST_RECONNECT_MAX_DELAY`] until the endpoint is online again.
+    fast_reconnect: bool,
 }
 
 impl ReconnectState {
@@ -61,6 +72,16 @@ impl ReconnectState {
             next_attempt: Some(now),
             in_flight: false,
             generation: None,
+            fast_reconnect: false,
+        }
+    }
+
+    fn retry_delay(&self) -> Duration {
+        let delay = retry_delay(self.attempts);
+        if self.fast_reconnect {
+            delay.min(FAST_RECONNECT_MAX_DELAY)
+        } else {
+            delay
         }
     }
 }
@@ -202,15 +223,37 @@ impl EndpointSupervisors {
             ClientEndpointStatus::Online => {
                 state.attempts = 0;
                 state.next_attempt = None;
+                state.fast_reconnect = false;
             }
             ClientEndpointStatus::Attention | ClientEndpointStatus::Disabled => {
                 state.next_attempt = None
             }
             ClientEndpointStatus::Connecting | ClientEndpointStatus::Reconnecting => {
                 state.attempts = state.attempts.saturating_add(1);
-                state.next_attempt = Some(now + retry_delay(state.attempts));
+                state.next_attempt = Some(now + state.retry_delay());
             }
         }
+        true
+    }
+
+    /// The local transport bridge for this connection reported that the
+    /// connection it is closing can be re-dialed without SSH. Caps the
+    /// backoff of the reconnect episode that follows; a connection that is
+    /// no longer the current generation is ignored. Returns whether the hint
+    /// was accepted.
+    pub(crate) fn expect_fast_reconnect(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        generation: u64,
+    ) -> bool {
+        let Some(state) = self
+            .endpoints
+            .get_mut(endpoint_id)
+            .filter(|state| state.generation == Some(generation))
+        else {
+            return false;
+        };
+        state.fast_reconnect = true;
         true
     }
 
@@ -429,6 +472,63 @@ mod tests {
     fn retry_backoff_is_bounded() {
         assert_eq!(retry_delay(1), INITIAL_RETRY_DELAY);
         assert_eq!(retry_delay(100), MAX_RETRY_DELAY);
+    }
+
+    /// Worst-case wait after the network returns, over the whole ladder: the
+    /// bridge's hint has to bring it from the 30 s cap to the 4 s one, and
+    /// only for the connection generation that sent it.
+    #[test]
+    fn a_bridge_reconnect_hint_caps_the_backoff_until_the_endpoint_is_online() {
+        let now = Instant::now();
+        let id = ClientEndpointId::Local;
+        let mut supervisors = EndpointSupervisors::new(&[], now);
+        supervisors.add_local(PathBuf::from("local"), Some(1), now);
+
+        // A stale generation's hint is refused.
+        assert!(!supervisors.expect_fast_reconnect(&id, 2));
+        assert!(supervisors.expect_fast_reconnect(&id, 1));
+        assert!(supervisors.disconnected(&id, 1, now));
+        let mut delays = Vec::new();
+        for attempt in 2..=8 {
+            let state = supervisors.endpoints.get_mut(&id).unwrap();
+            delays.push(state.next_attempt.unwrap() - now);
+            state.generation = Some(attempt);
+            state.in_flight = true;
+            assert!(supervisors.record_status(
+                &id,
+                attempt,
+                ClientEndpointStatus::Reconnecting,
+                now
+            ));
+        }
+        assert_eq!(
+            delays,
+            [500, 1000, 2000, 4000, 4000, 4000, 4000]
+                .map(Duration::from_millis)
+                .to_vec()
+        );
+        assert!(supervisors.endpoints[&id].fast_reconnect);
+
+        // Online consumes the hint: the next episode is paced by the full
+        // ladder again unless the bridge sends another one.
+        assert!(supervisors.record_status(&id, 8, ClientEndpointStatus::Online, now));
+        assert!(!supervisors.endpoints[&id].fast_reconnect);
+        let state = supervisors.endpoints.get_mut(&id).unwrap();
+        state.attempts = 6;
+        state.in_flight = true;
+        assert!(supervisors.disconnected(&id, 8, now));
+        assert_eq!(
+            supervisors.endpoints[&id].next_attempt,
+            Some(now + MAX_RETRY_DELAY)
+        );
+    }
+
+    #[test]
+    fn the_fast_reconnect_cap_is_shorter_than_the_transport_dial() {
+        // A reconnect attempt is a 2 s QUIC dial; capping the pause between
+        // attempts under that keeps the client dialing more than it waits.
+        assert!(FAST_RECONNECT_MAX_DELAY < MAX_RETRY_DELAY);
+        assert!(FAST_RECONNECT_MAX_DELAY >= retry_delay(4));
     }
 
     #[test]

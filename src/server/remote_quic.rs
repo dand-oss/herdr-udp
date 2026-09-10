@@ -42,10 +42,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HELLO_SIZE: usize = 4096;
 const TOKEN_MIN_LIFETIME: Duration = Duration::from_secs(60);
 const TOKEN_MAX_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// The server's own NAT keep-alive. The client drives resume probes; this is
-/// only the cheap heartbeat that keeps a middlebox binding warm well inside
-/// `remote.quic_transport_idle_timeout_seconds`.
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 // Flow-control caps, not allocations; see the client-side note in
 // src/remote/quic.rs. Sized for the render burst a graphics-heavy pane sends,
 // not for one high-latency link profile.
@@ -503,7 +499,13 @@ fn transport_config(idle_timeout: Duration) -> Result<quinn::TransportConfig, io
     })?;
     transport
         .max_idle_timeout(Some(idle))
-        .keep_alive_interval(Some(KEEP_ALIVE_INTERVAL))
+        // No transport keep-alive: the client bridge probes the path with
+        // health pings on a cadence far inside the shortest configurable idle
+        // timeout, and every one of them elicits a pong, so a server ping on
+        // top would only be a third radio wakeup on an idle link. A middlebox
+        // binding is kept warm by the client's probes, which is the direction
+        // a NAT mapping needs anyway.
+        .keep_alive_interval(None)
         // One bidirectional stream carries the whole framed protocol; a peer
         // that opens more is not speaking this transport.
         .max_concurrent_bidi_streams(VarInt::from_u32(1))
@@ -1000,11 +1002,23 @@ mod tests {
             "transport must idle out on the transport timeout, not the token lifetime: {rendered}"
         );
         assert!(
-            rendered.contains(&format!(
-                "keep_alive_interval: {:?}",
-                Some(KEEP_ALIVE_INTERVAL)
-            )),
-            "{rendered}"
+            rendered.contains("keep_alive_interval: None"),
+            "the server sends no keep-alive of its own; the client bridge probes: {rendered}"
+        );
+    }
+
+    /// Without a server keep-alive the client's probes are the only traffic
+    /// on an idle connection, so the shortest idle timeout an operator can
+    /// configure must outlast a probe interval plus the fast re-probes that
+    /// follow one lost probe, or an idle client would be timed out by its
+    /// own silence.
+    #[test]
+    fn the_minimum_idle_timeout_outlasts_a_lost_client_probe() {
+        let minimum = Duration::from_secs(crate::config::REMOTE_TRANSPORT_IDLE_TIMEOUT_MIN_SECONDS);
+        let worst_client_silence = crate::remote::quic::WORST_CASE_PROBE_SILENCE;
+        assert!(
+            minimum >= worst_client_silence + Duration::from_secs(2),
+            "minimum idle timeout {minimum:?} must leave a round trip of slack over the client's worst-case probe silence {worst_client_silence:?}"
         );
     }
 

@@ -8,7 +8,7 @@ pub(crate) mod frame;
 mod host_unix;
 mod process;
 #[cfg(unix)]
-mod quic;
+pub(crate) mod quic;
 #[cfg(unix)]
 mod quic_bridge;
 #[cfg(unix)]

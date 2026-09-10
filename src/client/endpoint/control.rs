@@ -4,6 +4,10 @@ pub(crate) enum EndpointControlMessage {
     HealthPong,
     /// Local bridge hint: the transport path is recovering (`true`) or not.
     TransportRecovering(bool),
+    /// Local bridge hint: the transport it is closing can be re-dialed on a
+    /// credential that already carried a session, so the next reconnect
+    /// costs no SSH and deserves tight pacing.
+    TransportReconnectFast,
     Snapshot(Box<crate::protocol::ClientShellSnapshot>),
     Ignored,
 }
@@ -22,9 +26,11 @@ pub(crate) fn decode_endpoint_control(
         }
         let status: TransportStatus<'_> = serde_json::from_str(data)
             .map_err(|error| format!("invalid transport status: {error}"))?;
-        return Ok(EndpointControlMessage::TransportRecovering(
-            status.state == "recovering",
-        ));
+        return Ok(match status.state {
+            "recovering" => EndpointControlMessage::TransportRecovering(true),
+            "reconnect-fast" => EndpointControlMessage::TransportReconnectFast,
+            _ => EndpointControlMessage::TransportRecovering(false),
+        });
     }
     if kind == crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND {
         let snapshot = serde_json::from_str(data)
@@ -68,6 +74,14 @@ mod tests {
                 EndpointControlMessage::TransportRecovering(value) if value == recovering
             ));
         }
+        assert!(matches!(
+            decode_endpoint_control(
+                crate::protocol::endpoint::TRANSPORT_STATUS_KIND,
+                r#"{"state":"reconnect-fast"}"#,
+            )
+            .unwrap(),
+            EndpointControlMessage::TransportReconnectFast
+        ));
         assert!(
             decode_endpoint_control(crate::protocol::endpoint::TRANSPORT_STATUS_KIND, "{}")
                 .is_err()

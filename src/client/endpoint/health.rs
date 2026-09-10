@@ -1,12 +1,16 @@
 use std::time::{Duration, Instant};
 
-pub(super) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub(super) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Probe deadline while the endpoint's transport reports its path as
 /// recovering (a QUIC connection riding out a blackhole or an address change).
-/// Long enough to cover a tunnel; the transport itself gives up at the same
-/// bound, so the endpoint never sits in this state indefinitely.
-pub(super) const ROAMING_GRACE: Duration = Duration::from_secs(150);
+/// Long enough to cover a tunnel. The transport gives up after its own
+/// 150 s grace and closes the local socket, sending its reconnect hint first;
+/// this deadline sits a slow-probe interval and change behind it so that
+/// close, not this timer, is what ends the connection, and the hint is read.
+/// It is still a backstop: a bridge that never closes cannot hold the
+/// endpoint in this state indefinitely.
+pub(crate) const ROAMING_GRACE: Duration = Duration::from_secs(160);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HealthAction {

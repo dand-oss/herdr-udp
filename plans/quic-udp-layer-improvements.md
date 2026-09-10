@@ -106,6 +106,8 @@ only a changed source costs a rebind and a path validation, at most one per
 
 ## 2. Transport-aware reconnect pacing and one keepalive, not three
 
+**Status: implemented and measured** (see "Result" below). Baseline `ec36054a`.
+
 **Problem A.** After the 150 s roaming grace the bridge closes the local
 socket and the thin client's supervisor reconnects with upstream's
 0.5 s → 30 s backoff (`src/client/endpoint/supervisor.rs:11–12`). The QUIC
@@ -144,6 +146,29 @@ and idle packet count over 10 minutes from the relay counter.
 B: the server idle timeout (180 s default) must stay comfortably above the
 slowest client probe interval, which it does at 2 s; state that invariant in
 a test.
+
+**Result.** As built: the bridge writes `endpoint.transport.status.v1
+{ state: "reconnect-fast" }` as the last frame before closing the local
+socket on any pump exit that keeps the credential (lost, superseded, stream
+ended; not shutdown or rebootstrap); the supervisor caps that episode's
+backoff at 4 s until the endpoint is online; the client's roaming grace
+moved to 160 s so the bridge's 150 s close, which carries the hint, ends a
+lost connection rather than the client's own timer. For B the uplink pump
+recognizes the thin client's health ping by byte comparison against the
+bridge's own probe frame and books it as the bridge's probe, the bridge's
+healthy cadence is 6 s so the client's 5 s ping goes first, and the server's
+`keep_alive_interval` is gone; `WORST_CASE_PROBE_SILENCE` is asserted under
+the minimum configurable idle timeout.
+
+Design doc §8.6 has the tables, from two new `#[ignore]`d tests that drive
+the real supervisor and shell handshake through the bridge. 200 s full
+outage, restore → connected: 15.90 s at baseline, 0.75 s with the hint
+(baseline worst case is the 30 s cap, hinted worst case 4 s plus one 6 s
+attempt). Idle 120 s: 49/49 packets up/down at baseline, 48/48 after — no
+change, because the premise of Problem B was wrong on measurement: the
+bridge's probe always went first, its pong reset the client's ping timer,
+and quinn's keep-alive never fires on a connection that is probed every 5 s.
+B is kept for its ownership and the invariant test, not for a packet gain.
 
 ---
 

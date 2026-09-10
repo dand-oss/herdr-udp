@@ -63,7 +63,7 @@ happens (no `ssh` re-exec, no auth round).
 | Integration depth | Opaque framed-byte pipe. No QUIC-specific render generations, sync requests, resource caches, or status wire messages. Recovery after a truly lost connection is upstream's: drop the client connection, supervisor re-handshakes, fresh snapshot + full surface. |
 | Server placement | In-process `RemoteQuicServer` inside the server. Authenticated QUIC connections are adapted via a Unix socketpair into the existing client accept path. One userspace copy per frame; no sidecar daemon. |
 | Client placement | A bridge task owned by `connect_saved_ssh` (saved machines, noninteractive) and `run_remote` (standalone, interactive). Both return `{ stream: LocalStream, lifetime }` to their existing callers. The thin client is unaware of QUIC except for a local-only status hint. |
-| Liveness signal | Upstream's `endpoint.health.ping.v1`/`pong.v1` flow end-to-end through QUIC unmodified. The bridge additionally originates its own health pings on `PathMonitor`'s schedule (1 s fast-probe, not the client's 5 s cadence) and counts *any* QUIC→client frame as liveness, exactly as upstream's `EndpointHealth` does. No frame decoding, no dedupe against client pings (duplicates are a few bytes), no `RemotePing/RemotePong` wire variants. |
+| Liveness signal | Upstream's `endpoint.health.ping.v1`/`pong.v1` flow end-to-end through QUIC unmodified. The bridge additionally originates its own health pings on `PathMonitor`'s schedule (1 s fast-probe; 6 s healthy cadence, one second behind the client's 5 s) and counts *any* QUIC→client frame as liveness, exactly as upstream's `EndpointHealth` does. A client ping the bridge forwards is booked as a probe of its own — recognized by comparing bytes against the bridge's own ping frame, never by decoding — so an idle connection with a health check carries one ping per interval, not two, and the server runs no transport keep-alive on top (plan item 2). No `RemotePing/RemotePong` wire variants. |
 | Recovering-path grace | The bridge injects a local-only `ServerMessage::EndpointControl { kind: "endpoint.transport.status.v1" }` toward the thin client when the QUIC path enters/leaves `recovering`. While recovering, the client's heartbeat deadline is 150 s instead of 10 s and the endpoint shows Roaming rather than Reconnecting; input keeps flowing on the reliable control stream. The hint never crosses the server API. SSH endpoints are unchanged. |
 | After grace / lost | One close policy: the bridge closes the QUIC connection and the local socket. The thin client's supervisor reconnects to the same local socket; the bridge's next accepted connection reuses the process-wide cached credential and dials QUIC directly — no SSH. Supervisor backoff stays upstream's 0.5→30 s. Standalone `--remote` gets the same behavior by supervising its forwarded Local endpoint (today Local is supervised only when a saved machine is enabled). |
 | Transport ladder | Sequential, per accepted local connection: cached credential or SSH bootstrap → QUIC dial (2 s) → on rejection one re-bootstrap → SSH stdio fallback. One-way: once on SSH, stay for that connection. No QUIC-vs-SSH race: a host that blackholes UDP costs one 2 s timeout per connection; if measurement shows that matters, add a per-target negative cache, not a race. |
@@ -158,10 +158,14 @@ One ladder run per accepted local connection:
   wifi must not strand on the second-to-last address), lost at 150 s. Probes are
   ordinary `endpoint.health.ping.v1` frames; any received frame is liveness.
 - Emits `endpoint.transport.status.v1 { state: live | recovering }` to the
-  thin client on transitions. Never forwards it upstream.
+  thin client on transitions, and `{ state: reconnect-fast }` as the last
+  frame before it closes the local socket on an exit that keeps the credential
+  (lost, superseded, stream ended — not shutdown or rebootstrap). Never
+  forwards any of them upstream.
 - Lost, superseded, or server-closed → close the local socket. The supervisor's
   next connection reuses the cached credential with `connection_generation + 1`
-  and skips SSH entirely. Connect-time `Retry` failures get a bounded budget
+  and skips SSH entirely; after a `reconnect-fast` hint it caps its backoff
+  at 4 s instead of 30 s until the endpoint is online again (plan item 2). Connect-time `Retry` failures get a bounded budget
   (5 attempts, 250 ms → 4 s) before SSH fallback; `Rebootstrap` drops the cached
   credential and re-runs SSH bootstrap once.
 
@@ -179,8 +183,12 @@ fds; the successor imports them before accepting.
 ### 5.5 Client health integration
 
 `registry.rs` gains awareness of `endpoint.transport.status.v1` from its local
-transport: `EndpointHealth` takes a `recovering: bool`; `action()` uses 150 s
-when set, 10 s otherwise. The endpoint status enum gains `Roaming` (presentation
+transport: `EndpointHealth` takes a `recovering: bool`; `action()` uses 160 s
+when set, 10 s otherwise — ten seconds behind the bridge's own 150 s grace, so
+the bridge's close (which carries the reconnect hint) is what ends a lost
+connection and the client's deadline stays a backstop. The supervisor takes
+the `reconnect-fast` hint from the same frame kind and caps that episode's
+backoff at 4 s. The endpoint status enum gains `Roaming` (presentation
 only, client-side). Standalone `--remote` marks its forwarded Local endpoint as
 supervised (today only federated clients supervise Local) so a bridge-closed
 socket reconnects instead of exiting the client. No server change.
@@ -333,6 +341,53 @@ wildcard socket follows the route change by itself — and its port-dead
 recovery is `REBIND_AFTER` counted from the oldest unanswered probe. With the
 watcher, `HERDR_LOG=herdr=info` shows two rebinds per flap: one when the
 source falls back to the default route, one when the new address appears.
+
+### 8.6 Post-grace reconnect and idle traffic (plan item 2)
+
+Two more `#[ignore]`d tests in `src/remote/benchmark.rs` drive the thin
+client's own endpoint supervisor, connect path, and semantic-shell handshake
+through the real bridge and relay (only a shell client is answered with
+health pongs, and only the supervisor paces reconnects). What the client's
+event loop does with the frames it reads — book any message as liveness,
+count pongs, hand the transport hint to the supervisor, report a closed
+socket — is emulated in a few lines; everything else is the real code.
+
+`remote_quic_outage_reconnect_scenario` is §8.3's "200 s full outage": the
+relay drops everything for 200 s, the bridge gives the connection up at its
+150 s grace, and the supervisor reconnects on its ladder until the relay
+reopens. Each failed attempt costs about 6 s of its own (2 s dial, then the
+SSH-port probe against an unresolvable target). Run 2026-09-10, debug builds,
+relay in online mode, one run per build:
+
+| build | lost after | hint on the closed connection | failed attempts after loss (s) | restore → connected |
+| --- | --- | --- | --- | --- |
+| `ec36054a` (30 s backoff cap) | 154.8 s | none | 6.3, 13.3, 21.3, 31.1, 45.1 | 15.90 s |
+| reconnect hint (plan item 2) | 155.8 s | `reconnect-fast`, applied | 6.2, 13.2, 21.2, 31.2, 41.0 | 0.75 s |
+
+The baseline's next attempt was due 16 s after its fifth failure; the hint
+holds the gap at 4 s, so the dial that follows the restore lands within one
+attempt's slack. The gain is phase-dependent: the baseline's worst case is
+the full 30 s cap, the hinted ladder's is 4 s plus one attempt.
+
+`remote_quic_idle_traffic` holds the connection idle for 120 s with the thin
+client's 5 s health-ping schedule emulated exactly and counts every datagram
+at the relay:
+
+| build | packets up / down | client pings | pongs seen by the client | bridge probes |
+| --- | --- | --- | --- | --- |
+| `ec36054a` | 49 / 49 | 1 | 25 | 24 |
+| plan item 2 | 48 / 48 | 24 | 24 | 0 |
+
+Same wire cost either way: one ping-sized packet and one ACK per 5 s in each
+direction. The plan's premise of three overlapping liveness mechanisms did
+not survive measurement. The bridge's 5 s probe always went out first, its
+pong reset the client's own timer, and quinn's server keep-alive only fires
+after 15 s without any ack-eliciting packet, so it never ran on a probed
+connection. What the change buys is that the probe now comes from the thin
+client (the bridge yields, cadence 6 s) and the server carries no keep-alive
+configuration that could start costing packets on a client without a health
+check; the packet count is unchanged, and the minimum configurable idle
+timeout is asserted against the client's worst-case probe silence.
 
 ## 9. Source inventory from `feat/resumable-quic`
 

@@ -81,6 +81,10 @@ const SSH_REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 /// so a dial started now cannot lose a race against the server's own expiry
 /// check.
 const CREDENTIAL_EXPIRY_SLACK: Duration = Duration::from_secs(30);
+/// How long the closing pump waits for the thin client to take the reconnect
+/// hint. A client that is not reading its socket gets no hint; it is not
+/// worth holding the close for.
+const RECONNECT_HINT_WRITE_BUDGET: Duration = Duration::from_millis(500);
 /// Application close code the bridge sends when it tears a connection down.
 /// The server never interprets a client's close code — it only sees the
 /// connection end — so one code covers every bridge-side close.
@@ -91,6 +95,12 @@ pub(crate) const TRANSPORT_STATE_LIVE: &str = "live";
 /// The QUIC path is silent but not yet abandoned: the thin client stretches its
 /// heartbeat deadline to the roaming grace and shows roaming, not reconnecting.
 pub(crate) const TRANSPORT_STATE_RECOVERING: &str = "recovering";
+/// The bridge is closing the local socket, but the credential it holds has
+/// carried a live session and is still good: the next connection is one UDP
+/// dial with no SSH, so the thin client's supervisor may pace it tightly.
+/// Sent as the last frame before the close, so the client reads it before the
+/// end of stream that starts the reconnect.
+pub(crate) const TRANSPORT_STATE_RECONNECT_FAST: &str = "reconnect-fast";
 
 pub(crate) struct QuicBridgeConfig {
     pub target: String,
@@ -617,39 +627,127 @@ async fn run_pump(
     let (mut local_read, local_write) = local.into_split();
     let send = AsyncMutex::new(send);
     let local_write = AsyncMutex::new(local_write);
+    // Encoded once: the probe is the same frame every time, and the thin
+    // client's own health ping is byte-for-byte this frame too, which is how
+    // the uplink recognizes one without decoding anything.
+    let ping = match health_ping_frame() {
+        Ok(ping) => ping,
+        Err(detail) => return PumpExit::Ended(detail),
+    };
     // Depth one: the monitor only needs to know that *something* arrived, so a
     // receipt dropped because one is already pending loses no information.
     let (receipts_tx, receipts_rx) = mpsc::channel(1);
+    let (client_probes_tx, client_probes_rx) = mpsc::channel(1);
 
-    let uplink = async {
-        match copy_frames(&mut local_read, &send, MAX_FRAME_SIZE, None).await {
-            Ok(()) => PumpExit::LocalClosed,
-            Err(detail) => PumpExit::Ended(detail),
+    // Scoped so every copy future is dropped — and any writer lock a
+    // half-written frame held is released — before the hint below is written.
+    let exit = {
+        let uplink = async {
+            match copy_frames(
+                &mut local_read,
+                &send,
+                MAX_FRAME_SIZE,
+                Some(FrameWitness::Matching {
+                    probe: ping.clone(),
+                    sender: client_probes_tx,
+                }),
+            )
+            .await
+            {
+                Ok(()) => PumpExit::LocalClosed,
+                Err(detail) => PumpExit::Ended(detail),
+            }
+        };
+        let downlink = async {
+            match copy_frames(
+                &mut recv,
+                &local_write,
+                MAX_GRAPHICS_FRAME_SIZE,
+                Some(FrameWitness::Every(receipts_tx)),
+            )
+            .await
+            {
+                Ok(()) => PumpExit::Ended("remote QUIC stream ended".to_owned()),
+                Err(detail) => PumpExit::Ended(detail),
+            }
+        };
+        let monitor = drive_path(
+            session,
+            &send,
+            &local_write,
+            &ping,
+            receipts_rx,
+            client_probes_rx,
+        );
+        let stop = wait_for_stop(should_stop);
+        tokio::pin!(uplink, downlink, monitor, stop);
+
+        tokio::select! {
+            exit = &mut uplink => exit,
+            exit = &mut downlink => exit,
+            exit = &mut monitor => exit,
+            exit = session.closed() => PumpExit::Closed(exit),
+            () = &mut stop => PumpExit::Stopped,
         }
     };
-    let downlink = async {
-        match copy_frames(
-            &mut recv,
-            &local_write,
-            MAX_GRAPHICS_FRAME_SIZE,
-            Some(receipts_tx),
+    if reconnect_is_cheap(&exit) {
+        // Best effort, bounded, and last: the client may already be gone or
+        // not reading, and nothing after this frame matters to it.
+        match tokio::time::timeout(
+            RECONNECT_HINT_WRITE_BUDGET,
+            announce_reconnect_fast(&local_write),
         )
         .await
         {
-            Ok(()) => PumpExit::Ended("remote QUIC stream ended".to_owned()),
-            Err(detail) => PumpExit::Ended(detail),
+            Ok(Ok(())) => {}
+            Ok(Err(detail)) => {
+                debug!(%detail, "could not send the reconnect hint before closing")
+            }
+            Err(_) => debug!("the thin client did not take the reconnect hint in time"),
         }
-    };
-    let monitor = drive_path(session, &send, &local_write, receipts_rx);
-    let stop = wait_for_stop(should_stop);
-    tokio::pin!(uplink, downlink, monitor, stop);
+    }
+    exit
+}
 
-    tokio::select! {
-        exit = &mut uplink => exit,
-        exit = &mut downlink => exit,
-        exit = &mut monitor => exit,
-        exit = session.closed() => PumpExit::Closed(exit),
-        () = &mut stop => PumpExit::Stopped,
+/// Whether the connection the pump just lost can be re-dialed on the
+/// credential in hand without SSH. It was proven the moment the pump started,
+/// so only an exit that kills the credential says no; a thin client that hung
+/// up, or a stopping bridge, has no reconnect to pace.
+fn reconnect_is_cheap(exit: &PumpExit) -> bool {
+    match exit {
+        PumpExit::LocalClosed | PumpExit::Stopped => false,
+        PumpExit::Closed(exit) => !credential_is_dead(exit),
+        PumpExit::Ended(_) => true,
+    }
+}
+
+/// Who is told about the frames crossing one direction of the pump.
+enum FrameWitness {
+    /// Every frame: on the downlink, any byte from the peer proves the path.
+    Every(mpsc::Sender<()>),
+    /// Only frames byte-equal to `probe`: on the uplink, the thin client's own
+    /// health ping is the one frame the bridge counts as a probe of its own,
+    /// so it does not send a second one on the same path moments later. A
+    /// keystroke is not evidence of anything — the program it goes to may
+    /// answer with nothing — so it is deliberately not counted.
+    Matching {
+        probe: Vec<u8>,
+        sender: mpsc::Sender<()>,
+    },
+}
+
+impl FrameWitness {
+    fn saw(&self, payload: &[u8]) {
+        let sender = match self {
+            Self::Every(sender) => sender,
+            Self::Matching { probe, sender } => {
+                if payload != probe.as_slice() {
+                    return;
+                }
+                sender
+            }
+        };
+        let _ = sender.try_send(());
     }
 }
 
@@ -658,13 +756,13 @@ async fn run_pump(
 ///
 /// Frames stay opaque: the bridge reads the `[u32 LE len]` header only to keep
 /// frame alignment, which is what lets it slip a frame of its own between two
-/// forwarded ones. `receipts` is notified as soon as a frame has been read, so
-/// path liveness never waits on the far side of the copy draining it.
+/// forwarded ones. `witness` is told as soon as a frame has been read, so path
+/// liveness never waits on the far side of the copy draining it.
 async fn copy_frames<R, W>(
     reader: &mut R,
     writer: &AsyncMutex<W>,
     max: usize,
-    receipts: Option<mpsc::Sender<()>>,
+    witness: Option<FrameWitness>,
 ) -> Result<(), String>
 where
     R: AsyncRead + Unpin,
@@ -675,8 +773,8 @@ where
         if !read_frame(reader, max, &mut payload).await? {
             return Ok(());
         }
-        if let Some(receipts) = &receipts {
-            let _ = receipts.try_send(());
+        if let Some(witness) = &witness {
+            witness.saw(&payload);
         }
         let mut writer = writer.lock().await;
         write_frame(&mut *writer, &payload).await?;
@@ -735,22 +833,26 @@ where
 /// moved this path's source address (or, failing such evidence, when the
 /// silence looks like one), and tell the thin client when the path starts or
 /// stops recovering.
+///
+/// `client_probes` reports every health ping the thin client sent on the
+/// uplink. Each one is a probe of the same path as the bridge's own, so it is
+/// booked as one: the healthy cadence restarts from it and the bridge does not
+/// add a second ping behind it. The thin client pings every 5 s from the last
+/// frame it saw; the bridge's cadence is longer, so on a connection with a
+/// health check the client's ping is the one that goes out and the bridge only
+/// judges the answer.
 async fn drive_path<S, L>(
     session: &QuicSession,
     send: &AsyncMutex<S>,
     local_write: &AsyncMutex<L>,
+    ping: &[u8],
     mut receipts: mpsc::Receiver<()>,
+    mut client_probes: mpsc::Receiver<()>,
 ) -> PumpExit
 where
     S: AsyncWrite + Unpin,
     L: AsyncWrite + Unpin,
 {
-    // Encoded once: the probe is the same frame every time, and the client's
-    // own pings pass through untouched, so a duplicate ping is harmless.
-    let ping = match health_ping_frame() {
-        Ok(ping) => ping,
-        Err(detail) => return PumpExit::Ended(detail),
-    };
     let mut monitor = PathMonitor::new(Instant::now());
     let remote = session.remote_addr();
     let watcher = open_address_change_watcher();
@@ -783,7 +885,7 @@ where
                                 }
                                 let write = {
                                     let mut send = send.lock().await;
-                                    write_frame(&mut *send, &ping).await
+                                    write_frame(&mut *send, ping).await
                                 };
                                 if let Err(detail) = write {
                                     return PumpExit::Ended(detail);
@@ -793,6 +895,9 @@ where
                         }
                     }
                 }
+            }
+            () = client_probe_forwarded(&mut client_probes) => {
+                monitor.probe_sent(Instant::now());
             }
             receipt = receipts.recv() => {
                 if receipt.is_none() {
@@ -811,7 +916,7 @@ where
                 if outcome.probe {
                     let write = {
                         let mut send = send.lock().await;
-                        write_frame(&mut *send, &ping).await
+                        write_frame(&mut *send, ping).await
                     };
                     if let Err(detail) = write {
                         return PumpExit::Ended(detail);
@@ -880,6 +985,16 @@ async fn address_change_announced(
     changed
 }
 
+/// Resolves once per health ping the thin client sends. When the uplink has
+/// ended the pump's own uplink branch reports it, so this side simply stays
+/// idle in the select instead of spinning on a closed channel.
+async fn client_probe_forwarded(probes: &mut mpsc::Receiver<()>) {
+    match probes.recv().await {
+        Some(()) => {}
+        None => std::future::pending().await,
+    }
+}
+
 async fn wait_for_stop(should_stop: &AtomicBool) {
     while !should_stop.load(Ordering::Acquire) {
         tokio::time::sleep(SHUTDOWN_POLL).await;
@@ -899,6 +1014,17 @@ where
         return Ok(());
     };
     let frame = transport_status_frame(state)?;
+    let mut writer = local_write.lock().await;
+    write_frame(&mut *writer, &frame).await
+}
+
+/// Tell the thin client, as the last frame before the local socket closes,
+/// that its next connection is a cheap re-dial.
+async fn announce_reconnect_fast<W>(local_write: &AsyncMutex<W>) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    let frame = transport_status_frame(TRANSPORT_STATE_RECONNECT_FAST)?;
     let mut writer = local_write.lock().await;
     write_frame(&mut *writer, &frame).await
 }
@@ -1680,7 +1806,11 @@ mod tests {
 
     #[test]
     fn the_injected_status_frame_is_a_readable_server_control() {
-        for state in [TRANSPORT_STATE_LIVE, TRANSPORT_STATE_RECOVERING] {
+        for state in [
+            TRANSPORT_STATE_LIVE,
+            TRANSPORT_STATE_RECOVERING,
+            TRANSPORT_STATE_RECONNECT_FAST,
+        ] {
             let payload = transport_status_frame(state).expect("encode");
             let mut framed = Vec::new();
             framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -1714,6 +1844,54 @@ mod tests {
                 data: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn the_client_health_ping_is_byte_identical_to_the_bridge_probe() {
+        // The uplink witness relies on it: a thin client ping is recognized
+        // by comparing bytes, never by decoding.
+        let mut framed = Vec::new();
+        crate::protocol::write_message(
+            &mut framed,
+            &ClientMessage::EndpointControl {
+                kind: HEALTH_PING_KIND.to_owned(),
+                data: String::new(),
+            },
+        )
+        .expect("encode");
+        let probe = health_ping_frame().expect("encode");
+        assert_eq!(&framed[FRAME_HEADER_BYTES..], probe.as_slice());
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        let witness = FrameWitness::Matching {
+            probe: probe.clone(),
+            sender,
+        };
+        witness.saw(b"a keystroke");
+        assert!(receiver.try_recv().is_err(), "a keystroke is not a probe");
+        witness.saw(&probe);
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn only_an_exit_that_keeps_the_credential_earns_the_reconnect_hint() {
+        assert!(!reconnect_is_cheap(&PumpExit::LocalClosed));
+        assert!(!reconnect_is_cheap(&PumpExit::Stopped));
+        assert!(!reconnect_is_cheap(&PumpExit::Closed(
+            SessionExit::Shutdown("gone".into())
+        )));
+        assert!(!reconnect_is_cheap(&PumpExit::Closed(
+            SessionExit::Rebootstrap("expired".into())
+        )));
+        assert!(reconnect_is_cheap(&PumpExit::Closed(
+            SessionExit::Superseded
+        )));
+        assert!(reconnect_is_cheap(&PumpExit::Closed(SessionExit::Retry(
+            "later".into()
+        ))));
+        assert!(reconnect_is_cheap(&PumpExit::Ended(
+            "silent for more than 150 s".into()
+        )));
     }
 
     #[test]

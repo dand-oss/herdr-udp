@@ -40,9 +40,17 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// this is only a placeholder rustls requires.
 const TLS_SERVER_NAME: &str = "herdr";
 /// Cadence at which a healthy path is re-probed. The bridge originates a
-/// health ping on this schedule; the transport contributes no keep-alive of
-/// its own, so this is the only liveness traffic.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// health ping on this schedule; neither peer's transport contributes a
+/// keep-alive of its own, so this is the only liveness traffic on an idle
+/// path with no client health check.
+///
+/// One second longer than the thin client's own 5 s health ping (which the
+/// client sends up to a 100 ms loop tick after the interval): on a saved
+/// machine connection the client's ping goes out first, the bridge books it
+/// as its probe, and only one ping crosses the link per interval. Only the
+/// standalone `--remote` Local endpoint, which has no health check, is probed
+/// by the bridge at this cadence.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(6);
 /// Silence at which probing switches to `FAST_PROBE_INTERVAL`. Nothing the
 /// user can see happens here: no status change, no change in how input is
 /// handled. Probes into a dead path are free, so this is deliberately eager.
@@ -76,6 +84,14 @@ const FAST_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 const FAST_PROBE_WINDOW: Duration = Duration::from_secs(30);
 /// Probe cadence after `FAST_PROBE_WINDOW` of continuous silence.
 const SLOW_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+/// Longest a healthy idle connection leaves the server without a packet
+/// from the client: one heartbeat, then two consecutive probes lost. The
+/// server has no keep-alive of its own, so its shortest configurable idle
+/// timeout must outlast this; `src/server/remote_quic.rs` asserts it.
+#[cfg(test)]
+pub(crate) const WORST_CASE_PROBE_SILENCE: Duration = Duration::from_millis(
+    HEARTBEAT_INTERVAL.as_millis() as u64 + 2 * FAST_PROBE_INTERVAL.as_millis() as u64,
+);
 /// Rebind the local socket after this much silence, and again after every
 /// further `REBIND_AFTER` the silence continues. Rebinding answers a local
 /// address change from sleep or roaming; doing it for a brief flap only
@@ -928,6 +944,33 @@ fn wildcard_for(remote_ip: IpAddr) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The thin client pings 5 s after the last frame it saw, up to one
+    /// 100 ms loop tick late. The bridge's own cadence must be longer, or
+    /// the bridge probes first and the client's ping follows it anyway: two
+    /// pings per interval instead of one.
+    #[test]
+    fn the_bridge_heartbeat_yields_to_the_client_health_ping() {
+        let client_ping = crate::client::endpoint::health::HEARTBEAT_INTERVAL;
+        let client_tick = Duration::from_millis(100);
+        assert!(HEARTBEAT_INTERVAL > client_ping + client_tick);
+        assert!(HEARTBEAT_INTERVAL < client_ping * 2);
+        assert_eq!(
+            WORST_CASE_PROBE_SILENCE,
+            HEARTBEAT_INTERVAL + FAST_PROBE_INTERVAL * 2
+        );
+    }
+
+    /// The bridge, not the thin client, ends a lost connection: it closes
+    /// the local socket at its grace and sends the reconnect hint first. The
+    /// client's own deadline sits behind that close by more than one
+    /// slow-probe tick so the hint is always read.
+    #[test]
+    fn the_client_roaming_grace_trails_the_bridge_grace() {
+        let client_grace = crate::client::endpoint::health::ROAMING_GRACE;
+        assert!(client_grace > ROAMING_GRACE + SLOW_PROBE_INTERVAL);
+        assert!(client_grace < ROAMING_GRACE + Duration::from_secs(30));
+    }
     use crate::protocol::{REMOTE_QUIC_ID_BYTES, REMOTE_QUIC_TOKEN_BYTES};
     use rustls::client::danger::ServerCertVerifier as _;
     use tokio::sync::mpsc;
